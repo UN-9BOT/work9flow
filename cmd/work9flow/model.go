@@ -78,6 +78,14 @@ type actionMsg struct {
 	text string
 	err  error
 }
+type wsEventMsg struct {
+	runID string
+	event protocol.EventDTO
+}
+type wsClosedMsg struct {
+	runID string
+	err   error
+}
 
 // ----- model -----
 
@@ -106,6 +114,21 @@ type model struct {
 	quitting bool
 	statusMsg string
 	statusAt  time.Time
+
+	// wsCancel closes the active WebSocket subscription for the
+	// detail/events views. nil = no active subscription. Reset on
+	// every view change so the bubbletea loop stays in lockstep
+	// with the WS goroutine.
+	wsCancel  func()
+	// wsChan is the live event channel for the active run; kept so
+	// the bubbletea loop can re-arm readOneWS after each event.
+	wsChan    <-chan protocol.EventDTO
+	// wsRunID is the run currently subscribed to (or "").
+	wsRunID   string
+	// wsBackoffUntil controls how long to wait before re-polling
+	// after a WS drop. We still need REST polling to recover state
+	// when the broker closes our socket (server restart, etc).
+	wsBackoffUntil time.Time
 }
 
 func newModel(base string) *model {
@@ -167,6 +190,53 @@ func (m *model) fetchAttentions(runID string) tea.Cmd {
 		atts, err := m.client.ListAttentions(ctx, runID)
 		return attentionsMsg{atts: atts, err: err}
 	}
+}
+
+// startWatch opens a WebSocket subscription for runID and schedules a
+// bubbletea command that reads one event from it. Subsequent events
+// keep the chain going via nextWatch. The caller must already have
+// cancelled any previous subscription (use stopWatch on view change).
+func (m *model) startWatch(runID string) tea.Cmd {
+	if m.wsCancel != nil {
+		m.wsCancel()
+		m.wsCancel = nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	ch, wsCancel, err := m.client.SubscribeEvents(ctx, runID, m.eventSeq)
+	if err != nil {
+		cancel()
+		m.wsBackoffUntil = time.Now().Add(2 * time.Second)
+		return func() tea.Msg { return wsClosedMsg{runID: runID, err: err} }
+	}
+	m.wsCancel = func() {
+		wsCancel()
+		cancel()
+	}
+	m.wsChan = ch
+	m.wsRunID = runID
+	return readOneWS(ch, runID)
+}
+
+// readOneWS blocks on the next event from ch and wraps it in a
+// bubbletea command.
+func readOneWS(ch <-chan protocol.EventDTO, runID string) tea.Cmd {
+	return func() tea.Msg {
+		ev, ok := <-ch
+		if !ok {
+			return wsClosedMsg{runID: runID}
+		}
+		return wsEventMsg{runID: runID, event: ev}
+	}
+}
+
+// stopWatch closes the active WS subscription, if any.
+func (m *model) stopWatch() {
+	if m.wsCancel != nil {
+		m.wsCancel()
+		m.wsCancel = nil
+	}
+	m.wsRunID = ""
+	m.wsChan = nil
 }
 
 func (m *model) doCancel(id string) tea.Cmd {
@@ -265,6 +335,38 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Re-fetch current screen payload.
 		return m, m.refreshCurrent()
+	case wsEventMsg:
+		// Live event arrived over WS: append and re-schedule next read.
+		if msg.runID == m.wsRunID {
+			m.events = append(m.events, msg.event)
+			if msg.event.Seq > m.eventSeq {
+				m.eventSeq = msg.event.Seq
+			}
+			if len(m.events) > 500 {
+				m.events = m.events[len(m.events)-500:]
+			}
+			// Keep detail state fresh by re-fetching on state-affecting
+			// events; everything else just appends.
+			if isStateEvent(msg.event.Kind) {
+				return m, tea.Batch(readOneWS(m.wsCurrent(), msg.runID), m.fetchDetail(msg.runID))
+			}
+			return m, readOneWS(m.wsCurrent(), msg.runID)
+		}
+		return m, nil
+	case wsClosedMsg:
+		// WS dropped: schedule REST poll fallback after a short backoff
+		// and stop the subscription chain. refreshCurrent will pick up
+		// REST polling on the next tickMsg.
+		if m.wsCancel != nil && m.wsRunID == msg.runID {
+			m.wsCancel()
+			m.wsCancel = nil
+			m.wsRunID = ""
+		}
+		if msg.err != nil {
+			m.setStatus(fmt.Sprintf("ws closed: %v (polling fallback)", msg.err))
+		}
+		m.wsBackoffUntil = time.Now().Add(2 * time.Second)
+		return m, nil
 	case tickMsg:
 		if m.quitting {
 			return m, nil
@@ -286,11 +388,21 @@ func (m *model) refreshCurrent() tea.Cmd {
 		return m.fetchRuns()
 	case viewDetail:
 		if m.current != nil {
-			return m.fetchDetail(m.current.ID)
+			// Only re-fetch on tick if the WS is down or in backoff;
+			// otherwise the live event handler already keeps state fresh.
+			if m.wsRunID != m.current.ID && time.Now().After(m.wsBackoffUntil) {
+				return m.fetchDetail(m.current.ID)
+			}
+			return nil
 		}
 	case viewEvents:
 		if m.current != nil {
-			return m.fetchEvents(m.current.ID, m.eventSeq)
+			// Same gating: if WS is live for this run, append-on-event
+			// keeps us in sync. Only REST-poll when WS is down.
+			if m.wsRunID != m.current.ID && time.Now().After(m.wsBackoffUntil) {
+				return m.fetchEvents(m.current.ID, m.eventSeq)
+			}
+			return nil
 		}
 	case viewAttentions:
 		if m.current != nil {
@@ -300,10 +412,39 @@ func (m *model) refreshCurrent() tea.Cmd {
 	return nil
 }
 
+// wsCurrent returns the live event channel for the active run, if
+// any. Used by the readOneWS chain after startWatch.
+func (m *model) wsCurrent() <-chan protocol.EventDTO {
+	return m.wsChan
+}
+
+// isStateEvent returns true for event kinds that should trigger a
+// detail re-fetch when received over WS (state changes, agent
+// transitions, attention lifecycle). Values mirror internal/domain
+// EventKind string constants.
+func isStateEvent(kind string) bool {
+	switch kind {
+	case "stage.started",
+		"stage.completed",
+		"stage.failed",
+		"workflow.created",
+		"workflow.completed",
+		"workflow.failed",
+		"workflow.canceled",
+		"agent.started",
+		"agent.completed",
+		"attention.required",
+		"attention.resolved":
+		return true
+	}
+	return false
+}
+
 func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Global keys: q + ctrl+c quit; ? toggles help; 1..6 jump views.
 	switch msg.String() {
 	case "ctrl+c":
+		m.stopWatch()
 		m.quitting = true
 		return m, tea.Quit
 	case "q":
@@ -311,6 +452,7 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.view = m.previousView()
 			return m, nil
 		}
+		m.stopWatch()
 		m.quitting = true
 		return m, tea.Quit
 	case "?":
@@ -320,19 +462,26 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "1":
+		m.stopWatch()
 		m.view = viewDashboard
 		return m, m.fetchRuns()
 	case "2":
 		if m.current != nil {
+			prev := m.view
+			m.stopWatch()
 			m.view = viewDetail
-			return m, m.fetchDetail(m.current.ID)
+			if prev == viewDetail {
+				return m, m.fetchDetail(m.current.ID)
+			}
+			return m, m.startWatch(m.current.ID)
 		}
 	case "3":
 		if m.current != nil {
+			m.stopWatch()
 			m.view = viewEvents
 			m.events = nil
 			m.eventSeq = 0
-			return m, m.fetchEvents(m.current.ID, 0)
+			return m, m.startWatch(m.current.ID)
 		}
 	case "4":
 		if m.current != nil {
@@ -347,10 +496,12 @@ func (m *model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "esc":
 		if m.view == viewHelp {
+			m.stopWatch()
 			m.view = viewDashboard
 			return m, m.fetchRuns()
 		}
 		if m.view != viewDashboard {
+			m.stopWatch()
 			m.view = viewDashboard
 			return m, m.fetchRuns()
 		}
