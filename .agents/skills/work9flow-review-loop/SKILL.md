@@ -83,20 +83,19 @@ REVIEW_END <full-commit-sha> REQUEST_CHANGES
 где `<full-commit-sha>` — это `git rev-parse HEAD` ветки, на которой живёт
 PR (на момент отправки запроса).
 
-Сам submitted request **содержит** эту строку как шаблон, поэтому polling
-должен детектить **только verdict-bearing** marker
-(`REVIEW_END <sha> APPROVE` или `REVIEW_END <sha> REQUEST_CHANGES`),
-а не голый `REVIEW_END <sha>`. Иначе polling сам себе сматчится.
-
-Helper:
-
-```bash
-w9-review-wait "$SHA" --timeout 600 --interval 10
-# exit 0 → APPROVE, 2 → REQUEST_CHANGES, 3 → timeout
-```
+**Marker self-trigger prevention:** user-prompt НЕ должен содержать
+verbatim `REVIEW_END <sha> APPROVE` или `REVIEW_END <sha> REQUEST_CHANGES`.
+SHA в prompt указывается отдельно; ревьюер строит маркер сам, конкатенируя
+три части (`REVIEW_END` + пробел + SHA + пробел + verdict). Только в
+reviewer reply marker может появиться verbatim, поэтому polling безопасно
+ищет `REVIEW_END <sha> VERDICT` как contiguous substring в snapshot.
 
 Каждый цикл polling — один, максимум 60 секунд. По таймауту — ручной
-`snapshot` + ручная проверка.
+`snapshot` + ручная проверка в uids после моего submit.
+
+Если у тебя на `$PATH` есть optional helper `w9-review-wait` (см. Helpers
+section), он делает ровно то же самое; если нет — пользуйся
+`poll_loop`-функцией выше или просто grep.
 
 ## Iteration loop
 
@@ -115,27 +114,77 @@ PR_URL="$(gh pr create --base master --head "$(git rev-parse --abbrev-ref HEAD)"
             --title "<title>" --body-file /tmp/pr-body.md)" \
   || gh pr view --json url -q .url           # idempotent: use existing PR if any
 SHA="$(git rev-parse HEAD)"
-chat_url="$(w9-review-chat-url)"
-cdt select_page 2 >/dev/null 2>&1 \
+
+# Resolve chat URL — direct env/config read, no helper required.
+if [[ -n "${WORK9FLOW_REVIEW_CHAT_URL:-}" ]]; then
+  chat_url="$WORK9FLOW_REVIEW_CHAT_URL"
+else
+  conf="${WORK9FLOW_REVIEW_CHAT_CONFIG:-$HOME/.config/work9flow/review-loop.yaml}"
+  chat_url="$(awk -F': *' '/^[Cc]hat_url:/{v=$2; sub(/[[:space:]]*#.*$/,"",v); if(v!=""){print v;exit}}' "$conf" 2>/dev/null || true)"
+fi
+[[ -n "$chat_url" ]] || { echo "ERROR: WORK9FLOW_REVIEW_CHAT_URL not set and no chat_url in \$conf" >&2; exit 2; }
+
+# Focus the review chat tab.
+cdt select_page "${WORK9FLOW_REVIEW_CHAT_PAGE_INDEX:-2}" >/dev/null 2>&1 \
   || cdt navigate_page --url "$chat_url" >/dev/null
+sleep 2
+
 # Safe-shell pattern: write body to file, load into var, pass as single arg.
+# Template must NOT contain verbatim 'REVIEW_END <sha> APPROVE|REQUEST_CHANGES'
+# — see Review request template section.
 request_file="$(mktemp)"
 cat >"$request_file" <<BODY
 PR: $PR_URL
 Branch: $(git rev-parse --abbrev-ref HEAD)
 Bead: <bead-id> — <bead-title>
 SHA: $SHA
-...
+... (template body — see below) ...
 BODY
 uid="$(cdt take_snapshot 2>/dev/null | awk '/textbox/ { match($0,/uid=([0-9_]+)/,a); if(a[1]){print a[1]; exit} }')"
 value="$(cat "$request_file")"
 cdt fill "$uid" "$value"
 cdt press_key Enter
-loop w9-review-wait "$SHA" --timeout 60 --interval 5
-  exit 0 → APPROVE: ждать "мерж pr"
-  exit 2 → REQUEST_CHANGES: адресуй P1 (P2 по усмотрению), коммить, пуш, новый SHA, повтор
-  exit 3 → таймаут: cdt take_snapshot вручную, проверить в uids после моего submit, решить
+
+# Polling: pure cdt loop, no helper required. Look for the verdict-bearing
+# marker ONLY. The user prompt does NOT contain 'REVIEW_END $SHA VERDICT'
+# verbatim, so the marker can only appear in the reviewer's reply.
+#
+# Pattern: 'REVIEW_END <sha> APPROVE' or 'REVIEW_END <sha> REQUEST_CHANGES'
+# as a contiguous substring anywhere in the snapshot. If on history-paranoia,
+# restrict to uids > baseline_uid captured just after submit.
+poll_loop() {
+  local sha="$1" timeout_s="${2:-60}" interval_s="${3:-5}"
+  local deadline=$(($(date +%s) + timeout_s))
+  while (( $(date +%s) < deadline )); do
+    local snap; snap="$(cdt take_snapshot 2>/dev/null || true)"
+    if printf '%s' "$snap" | grep -Eq "REVIEW_END[[:space:]]+${sha}[[:space:]]+REQUEST_CHANGES"; then
+      echo "REQUEST_CHANGES" >&2; return 2
+    fi
+    if printf '%s' "$snap" | grep -Eq "REVIEW_END[[:space:]]+${sha}[[:space:]]+APPROVE([^[:alnum:]]|$)"; then
+      echo "APPROVE" >&2; return 0
+    fi
+    sleep "$interval_s"
+  done
+  echo "TIMEOUT" >&2; return 3
+}
+poll_loop "$SHA" 60 5
+  rc=$?
+  case "$rc" in
+    0) ;;  # APPROVE — fall through to pre-merge gate below
+    2) echo "REQUEST_CHANGES — адресуй P1, коммить, пуш, новый SHA, повтор"; exit 2 ;;
+    3) echo "TIMEOUT — cdt take_snapshot вручную, проверить в uids после моего submit, решить"; exit 3 ;;
+  esac
+
 on "мерж pr":
+  # PRE-MERGE GATE: the reviewed SHA must still be HEAD locally and on PR.
+  # Любое несовпадение → APPROVE invalidated → push → новый review.
+  APPROVED_SHA="<sha from latest APPROVE>"
+  LOCAL_SHA="$(git rev-parse HEAD)"
+  PR_SHA="$(gh pr view --json headRefOid -q .headRefOid)"
+  test "$APPROVED_SHA" = "$LOCAL_SHA"   || { echo "APPROVE invalidated: local HEAD moved"; exit 1; }
+  test "$APPROVED_SHA" = "$PR_SHA"      || { echo "APPROVE invalidated: PR HEAD moved"; exit 1; }
+  test -z "$(git status --porcelain)"    || { echo "APPROVE invalidated: working tree dirty"; exit 1; }
+  gh pr view --json state -q .state | grep -q OPEN || { echo "PR not open"; exit 1; }
   gh pr merge --squash --delete-branch
   git checkout master && git pull --ff-only
   bd close <id> --reason "..."
@@ -143,7 +192,10 @@ on "мерж pr":
 
 ## Review request template
 
-Пиши в файл, не интерполируй в shell:
+Пиши в файл, не интерполируй в shell. **Главное:** user-prompt НЕ должен
+содержать verbatim `REVIEW_END <sha> APPROVE` или `REVIEW_END <sha>
+REQUEST_CHANGES` — иначе polling сам себе сматчится. SHA указывай отдельно;
+маркер ревьюер строит сам, конкатенируя три части.
 
 ```text
 PR: <URL>
@@ -158,15 +210,15 @@ SHA: <full-commit-sha>
 <key files touched>
 
 Прошу code review. P1 должны быть исправлены обязательно, P2 — на твоё
-усмотрение. Заверши ответ точной строкой:
+усмотрение.
 
-REVIEW_END <full-commit-sha> APPROVE
+Заверши свой ответ ОДНОЙ СТРОКОЙ в самом конце, без переносов:
 
-или
+  REVIEW_END <space> <SHA из поля выше, скопированный дословно> <space> <APPROVE|REQUEST_CHANGES>
 
-REVIEW_END <full-commit-sha> REQUEST_CHANGES
+Никакого другого текста после verdict-строки.
 
-После APPROVE скажи «мерж pr» я смержу. После REQUEST_CHANGES я внесу
+После APPROVE скажи «мерж pr» я смержу. После REQUEST_CHANGES внесу
 правки и снова отправлю на ревью с новым SHA.
 
 Что делать дальше?
@@ -197,23 +249,26 @@ value="$(cat "$request_file")"
 cdt fill "$uid" "$value"
 cdt press_key Enter
 
-# Polling с verdict detection
+# Polling с verdict detection (без helper — inline функция в loop)
+# или, если w9-review-wait на $PATH:
 w9-review-wait "$SHA" --timeout 60 --interval 5
 ```
 
-## Helpers (personal automation, optional)
+## Helpers (purely optional, не требуются основным loop)
 
-Эти скрипты — **personal automation**. Они НЕ коммитятся в репозиторий и не
-обязательны: всё можно делать руками через `cdt`. Если они есть на `$PATH`
-(например `~/.local/bin/`), skill использует их как syntactic sugar.
+Эти скрипты — **pure syntactic sugar**, не часть contract. Iteration loop
+выше работает БЕЗ них напрямую через `cdt` + встроенную `poll_loop`.
+
+Если хочешь — держи их в `~/.local/bin/` или подобном user-level месте.
+Они НЕ коммитятся в репозиторий: их поведение уже воспроизведено в loop
+через `cdt`. Если они есть на `$PATH`, можно использовать как shorthand.
 
 - `w9-review-chat-url` — резолвит ChatGPT conversation URL из
   `$WORK9FLOW_REVIEW_CHAT_URL` или `~/.config/work9flow/review-loop.yaml`.
-  Без конфига — exit 2.
-- `w9-review-wait <sha>` — polling cdt snapshot, ищет
-  **verdict-bearing** marker (только когда marker — это всё содержимое одной
-  StaticText-ноды; отличает reviewer reply от моего submitted template).
-  Выходит с 0/2/3.
+  Без конфига — exit 2. Эквивалент в loop: прямая `awk`-проверка env/config.
+- `w9-review-wait <sha>` — polling cdt snapshot, ищет contiguous
+  `REVIEW_END <sha> VERDICT`. Выходит с 0/2/3. Эквивалент в loop:
+  `poll_loop`-функция выше.
 
 ## Anti-patterns
 
@@ -222,6 +277,9 @@ w9-review-wait "$SHA" --timeout 60 --interval 5
 - ❌ Ждать без маркера — старые ответы в чате ломают цикл.
 - ❌ Считать «голый `REVIEW_END <sha>`» за verdict — он есть в моём
   submitted request.
+- ❌ Класть verbatim `REVIEW_END <sha> APPROVE` / `... REQUEST_CHANGES` в
+  user prompt — polling сам себе сматчится. Промпт даёт SHA + инструкцию,
+  ревьюер строит marker сам.
 - ❌ Помечать beads закрытой до реального merge в `master`.
 - ❌ Делать merge без явной команды «мерж pr».
 - ❌ Писать коммиты без body / description.
