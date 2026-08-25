@@ -1,0 +1,24 @@
+# providers.toml — LLM provider catalog for work9flow.
+#
+# Each [provider] table describes one OpenAI-compatible endpoint.
+# The provider id (the table name) is the short name used in
+# model_roles and other config to reference it.
+#
+# Example below: the "minim" provider exposing MiniMax-M3.
+# Set MINIM_API_KEY in the environment before running work9flowd.
+
+[minim]
+display_name = "Custom (minim)"
+protocol = "openai"
+base_url = "https://api.minimax.io/v1"
+api_key_env = "MINIM_API_KEY"
+discover_models = false
+default_model = "minim/MiniMax-M3"
+
+[[minim.models]]
+id = "MiniMax-M3"
+tier = "strong"
+context_window = 400000
+max_output_tokens = 131072
+supports_thinking = true
+supports_vision = true
