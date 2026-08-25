@@ -42,6 +42,7 @@ type Server struct {
 	bootAt time.Time
 	logger *log.Logger
 	now    func() time.Time
+	broker *publishBroker
 }
 
 // New returns a Server configured from opts.
@@ -61,6 +62,7 @@ func New(opts Options) *Server {
 		bootAt: now(),
 		logger: logger,
 		now:    now,
+		broker: newPublishBroker(),
 	}
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 	mux.HandleFunc("GET /v1/version", s.handleVersion)
@@ -74,6 +76,7 @@ func New(opts Options) *Server {
 	mux.HandleFunc("POST /v1/attentions/{id}/answer", s.handleAttentionAnswer)
 	mux.HandleFunc("POST /v1/runs/{id}/steer", s.handleRunSteer)
 	mux.HandleFunc("POST /v1/runs/{id}/followup", s.handleRunFollowup)
+	mux.HandleFunc("GET /v1/runs/{id}/events/stream", s.handleRunEventsStream)
 	mux.Handle("/", http.HandlerFunc(jsonNotFound))
 	return s
 }
@@ -120,6 +123,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	return s.http.Shutdown(ctx)
 }
+
+// errNoStorage is returned by handlers that require storage when
+// the server was constructed without one.
+var errNoStorage = errors.New("runtime: no storage wired")
 
 // Repo exposes the underlying storage for callers (e.g. the DSH
 // adapter) that need to persist events. Returns nil when no Repo
@@ -196,9 +203,11 @@ func (s *Server) handleRunsCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "create_run_failed", err)
 		return
 	}
-	if _, err := s.opts.Repo.AppendEvent(r.Context(), run.ID, domain.EventKindWorkflowCreated, now, nil); err != nil {
+	if seq, err := s.opts.Repo.AppendEvent(r.Context(), run.ID, domain.EventKindWorkflowCreated, now, nil); err != nil {
 		writeError(w, http.StatusInternalServerError, "append_event_failed", err)
 		return
+	} else {
+		s.broker.publish(run.ID, domain.Event{RunID: run.ID, Seq: seq, Kind: domain.EventKindWorkflowCreated, At: now})
 	}
 	detail := protocol.FromRun(run, 0, 1, 0)
 	writeJSON(w, http.StatusCreated, protocol.RunCreateResponse{Run: detail})
@@ -241,9 +250,11 @@ func (s *Server) handleRunCancel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "cancel_rejected", err)
 		return
 	}
-	if _, err := s.opts.Repo.AppendEvent(r.Context(), id, domain.EventKindWorkflowCanceled, s.now().UTC(), nil); err != nil {
+	if seq, err := s.opts.Repo.AppendEvent(r.Context(), id, domain.EventKindWorkflowCanceled, s.now().UTC(), nil); err != nil {
 		writeError(w, http.StatusInternalServerError, "append_event_failed", err)
 		return
+	} else {
+		s.broker.publish(id, domain.Event{RunID: id, Seq: seq, Kind: domain.EventKindWorkflowCanceled, At: s.now().UTC()})
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -340,9 +351,17 @@ func (s *Server) handleAttentionAnswer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "get_attention_failed", err)
 		return
 	}
-	if _, err := s.opts.Repo.AppendEvent(r.Context(), got.RunID, domain.EventKindAttentionResolved, s.now().UTC(), mustJSON(map[string]string{"attention_id": id})); err != nil {
+	if seq, err := s.opts.Repo.AppendEvent(r.Context(), got.RunID, domain.EventKindAttentionResolved, s.now().UTC(), mustJSON(map[string]string{"attention_id": id})); err != nil {
 		writeError(w, http.StatusInternalServerError, "append_event_failed", err)
 		return
+	} else {
+		s.broker.publish(got.RunID, domain.Event{
+			RunID:   got.RunID,
+			Seq:     seq,
+			Kind:    domain.EventKindAttentionResolved,
+			At:      s.now().UTC(),
+			Data:    mustJSON(map[string]string{"attention_id": id}),
+		})
 	}
 	writeJSON(w, http.StatusOK, protocol.AttentionAnswerResponse{Attention: protocol.FromAttention(got)})
 }
@@ -367,6 +386,7 @@ func (s *Server) handleRunSteer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "append_event_failed", err)
 		return
 	}
+	s.broker.publish(id, domain.Event{RunID: id, Seq: seq, Kind: domain.EventKindSteerSent, At: s.now().UTC(), Data: mustJSON(req)})
 	writeJSON(w, http.StatusAccepted, protocol.SteerFollowupResponse{EventSeq: seq})
 }
 
@@ -390,6 +410,7 @@ func (s *Server) handleRunFollowup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "append_event_failed", err)
 		return
 	}
+	s.broker.publish(id, domain.Event{RunID: id, Seq: seq, Kind: domain.EventKindFollowupSent, At: s.now().UTC(), Data: mustJSON(req)})
 	writeJSON(w, http.StatusAccepted, protocol.SteerFollowupResponse{EventSeq: seq})
 }
 
