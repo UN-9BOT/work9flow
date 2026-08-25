@@ -146,6 +146,8 @@ func gatekeeperRunner(ar *agents.Runner) func(context.Context, *engine.StageInpu
 			return engine.StageResult{}, err
 		}
 		switch out.Kind {
+		case "advance":
+			return engine.StageResult{Kind: "advance"}, nil
 		case "approve":
 			return engine.StageResult{Kind: "advance"}, nil
 		case "revise":
@@ -233,6 +235,8 @@ func reviewerRunner(ar *agents.Runner) func(context.Context, *engine.StageInput)
 			return engine.StageResult{}, err
 		}
 		switch out.Kind {
+		case "advance":
+			return engine.StageResult{Kind: "advance"}, nil
 		case "approve":
 			return engine.StageResult{Kind: "advance"}, nil
 		case "revise":
