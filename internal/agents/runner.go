@@ -80,8 +80,22 @@ var ErrSessionIncomplete = errors.New("agents: session did not complete")
 // Runner wraps a DSH client with work9flow persistence so stage runners
 // can execute one DSH-backed agent end-to-end.
 type Runner struct {
-	DSH          *dsh.Client
+	// DSH is the typed HTTP client to runtime/dsh-bridge/. The bridge
+	// owns the upstream SDK and the JSON-RPC wire details; work9flow
+	// only sees the normalized surface (Health / CreateSession /
+	// Prompt / SnapshotEvents / Shutdown).
+	DSH          *dsh.Bridge
 	Repo         storage.Repo
+	// Provider is the upstream provider route (e.g. "deepseek"). The
+	// bridge pins provider+model on the initialize handshake when the
+	// session is first created, so we surface it explicitly instead of
+	// guessing from the model name.
+	Provider     string
+	// DefaultModel is the upstream model route used when a per-call model
+	// argument is empty. Real role routing lands with work9flow-4v1.13
+	// (RoleConfig resolution); this default keeps the engine tests alive
+	// without inventing per-stage models.
+	DefaultModel string
 	Now          func() time.Time
 	PollInterval time.Duration
 	PollBudget   time.Duration
@@ -89,10 +103,12 @@ type Runner struct {
 
 // New returns a Runner with sensible defaults. Override Now / intervals
 // in tests via the struct fields after construction.
-func New(c *dsh.Client, repo storage.Repo) *Runner {
+func New(c *dsh.Bridge, repo storage.Repo) *Runner {
 	return &Runner{
 		DSH:          c,
 		Repo:         repo,
+		Provider:     "deepseek",
+		DefaultModel: "deepseek-chat",
 		Now:          time.Now,
 		PollInterval: 50 * time.Millisecond,
 		PollBudget:   5 * time.Second,
@@ -110,10 +126,29 @@ func (r *Runner) Run(ctx context.Context, run domain.WorkflowRun, role, model st
 	if r.Repo == nil {
 		return Outcome{}, errors.New("agents: nil repo")
 	}
-	sessionID, err := r.DSH.CreateSession(ctx, dsh.SessionRequest{Role: role, Model: model})
+	if r.Provider == "" {
+		return Outcome{}, errors.New("agents: Runner.Provider not set")
+	}
+	provider := r.Provider
+	cwd := run.RepoPath
+	if cwd == "" {
+		cwd = "/"
+	}
+	if model == "" {
+		model = r.DefaultModel
+	}
+	if model == "" {
+		return Outcome{}, errors.New("agents: Runner.Run: model required (no DefaultModel set)")
+	}
+	ref, err := r.DSH.CreateSession(ctx, dsh.CreateSessionRequest{
+		Cwd:      cwd,
+		Provider: provider,
+		Model:    model,
+	})
 	if err != nil {
 		return Outcome{}, fmt.Errorf("agents: create session: %w", err)
 	}
+	sessionID := ref.ID
 	if _, err := r.Repo.AppendEvent(ctx, run.ID, domain.EventKindAgentStarted, r.now(), mustJSON(map[string]string{
 		"role":       role,
 		"model":      model,
@@ -121,9 +156,8 @@ func (r *Runner) Run(ctx context.Context, run domain.WorkflowRun, role, model st
 	})); err != nil {
 		return Outcome{}, err
 	}
-	if err := r.DSH.Followup(ctx, sessionID, dsh.FollowupRequest{
-		Message: instructions.Message,
-		Data:    instructions.Payload,
+	if _, err := r.DSH.Prompt(ctx, sessionID, []dsh.ContentBlock{
+		{Type: "text", Text: instructions.Message},
 	}); err != nil {
 		return Outcome{}, fmt.Errorf("agents: followup: %w", err)
 	}
@@ -132,7 +166,7 @@ func (r *Runner) Run(ctx context.Context, run domain.WorkflowRun, role, model st
 	if err != nil {
 		return Outcome{}, err
 	}
-	r.persistEvents(ctx, run.ID, sessionID, raw)
+	r.persistEvents(ctx, run.ID, raw)
 
 	final := findCompleted(raw)
 	if final == nil {
@@ -174,7 +208,7 @@ func (r *Runner) now() time.Time {
 // session emits agent.completed or the budget expires. The first call
 // typically returns immediately; subsequent calls re-read the stream
 // while the session is alive.
-func (r *Runner) pollEvents(ctx context.Context, sessionID string) ([]dsh.RawEvent, error) {
+func (r *Runner) pollEvents(ctx context.Context, sessionID string) ([]dsh.NormalizedEvent, error) {
 	interval := r.PollInterval
 	if interval <= 0 {
 		interval = 50 * time.Millisecond
@@ -184,14 +218,16 @@ func (r *Runner) pollEvents(ctx context.Context, sessionID string) ([]dsh.RawEve
 		budget = 5 * time.Second
 	}
 	deadline := time.Now().Add(budget)
+	var collected []dsh.NormalizedEvent
 	for {
-		evs, err := r.DSH.Events(ctx, sessionID)
+		batch, err := r.DSH.SnapshotEvents(ctx, sessionID)
 		if err != nil {
 			return nil, fmt.Errorf("agents: events: %w", err)
 		}
-		for _, e := range evs {
-			if e.Kind == "agent.completed" {
-				return evs, nil
+		for _, e := range batch {
+			collected = append(collected, e)
+			if e.Kind == domain.EventKindAgentCompleted {
+				return collected, nil
 			}
 		}
 		if time.Now().After(deadline) {
@@ -205,16 +241,16 @@ func (r *Runner) pollEvents(ctx context.Context, sessionID string) ([]dsh.RawEve
 	}
 }
 
-func (r *Runner) persistEvents(ctx context.Context, runID, sessionID string, raw []dsh.RawEvent) {
-	for _, n := range dsh.Normalize(sessionID, raw) {
+func (r *Runner) persistEvents(ctx context.Context, runID string, raw []dsh.NormalizedEvent) {
+	for _, n := range raw {
 		_, _ = r.Repo.AppendEvent(ctx, runID, n.Kind, n.At, n.Data)
 	}
 }
 
 // findCompleted returns the final agent.completed event, or nil.
-func findCompleted(raw []dsh.RawEvent) *dsh.RawEvent {
+func findCompleted(raw []dsh.NormalizedEvent) *dsh.NormalizedEvent {
 	for i := len(raw) - 1; i >= 0; i-- {
-		if raw[i].Kind == "agent.completed" {
+		if raw[i].Kind == domain.EventKindAgentCompleted {
 			return &raw[i]
 		}
 	}

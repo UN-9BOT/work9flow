@@ -18,12 +18,12 @@ import (
 type Config struct {
 	StateDir        string            `yaml:"state_dir"`
 	RuntimeEndpoint string            `yaml:"runtime_endpoint"`
-	DSHEndpoint     string            `yaml:"dsh_endpoint"`
+	DSHBridgeAddr     string            `yaml:"dsh_bridge_addr"`
 	WorkspaceDir    string            `yaml:"workspace_dir"`
 	IterationLimits map[string]int    `yaml:"iteration_limits"`
 	ModelRoles      map[string]string `yaml:"model_roles"`
 	// ProvidersFile points at a TOML file describing LLM providers
-	// (e.g. providers.toml). When DSHEndpoint is empty and this is
+	// (e.g. providers.toml). When DSHBridgeAddr is empty and this is
 	// set, work9flowd boots an inline OpenAI-compatible DSH that
 	// routes requests through the named provider/model from ModelRoles.
 	ProvidersFile   string            `yaml:"providers_file"`
@@ -77,8 +77,8 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("WORK9FLOW_RUNTIME_ENDPOINT"); v != "" {
 		cfg.RuntimeEndpoint = v
 	}
-	if v := os.Getenv("WORK9FLOW_DSH_ENDPOINT"); v != "" {
-		cfg.DSHEndpoint = v
+	if v := os.Getenv("WORK9FLOW_DSH_BRIDGE_ADDR"); v != "" {
+		cfg.DSHBridgeAddr = v
 	}
 	if v := os.Getenv("WORK9FLOW_WORKSPACE_DIR"); v != "" {
 		cfg.WorkspaceDir = v

@@ -55,7 +55,7 @@ id = "test"
 	t.Setenv("FAKE_KEY", "test-key")
 
 	// 2) Load + boot inline DSH against the fake provider (same
-	// wiring cmd/work9flowd uses when DSHEndpoint == "").
+	// wiring cmd/work9flowd uses when DSHBridgeAddr == "").
 	pf, err := providers.LoadFile(provPath)
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +76,7 @@ id = "test"
 		t.Fatal(err)
 	}
 	defer repo.Close()
-	c := dsh.NewClient(srv.URL)
+	c := dsh.NewBridge(srv.URL)
 	ar := agents.New(c, repo)
 	ar.PollInterval = 5 * time.Millisecond
 	ar.PollBudget = 500 * time.Millisecond
@@ -114,13 +114,13 @@ id = "test"
 	}
 
 	// 5) Sanity: the inline DSH health endpoint reports ok.
-	resp, err := http.Get(srv.URL + "/v1/health")
+	resp, err := http.Get(srv.URL + "/health")
 	if err != nil {
 		t.Fatal(err)
 	}
 	raw, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if !bytes.Contains(raw, []byte(`"status":"ok"`)) {
-		t.Errorf("/v1/health body = %q", string(raw))
+	if !bytes.Contains(raw, []byte(`"status":"ready"`)) {
+		t.Errorf("/health body = %q", string(raw))
 	}
 }

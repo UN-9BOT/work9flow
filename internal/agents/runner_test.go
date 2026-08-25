@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,70 +15,89 @@ import (
 	"github.com/unbot/work9flow/internal/storage"
 )
 
-// scriptedDSH is an httptest server that pretends to be DSH. Tests
-// pre-load a script of (sessionID -> events); on /events it returns
-// the events as NDJSON. The runner polls; the first call that returns
-// an agent.completed event lets the runner exit its loop.
-type scriptedDSH struct {
+// scriptedBridge is an httptest server that mimics runtime/dsh-bridge.
+// Tests pre-load a list of SSE frames per session; on /events it
+// writes each frame as `data: <json>\n\n` and closes the stream so
+// SnapshotEvents returns the whole batch.
+type scriptedBridge struct {
 	mu     sync.Mutex
-	script map[string][]dsh.RawEvent
-	hits   int
+	script map[string][]dsh.RawBridgeEvent
 }
 
-func newScriptedDSH() *scriptedDSH { return &scriptedDSH{script: map[string][]dsh.RawEvent{}} }
+func newScriptedBridge() *scriptedBridge { return &scriptedBridge{script: map[string][]dsh.RawBridgeEvent{}} }
 
-func (s *scriptedDSH) handler() http.Handler {
+// eventFrame builds a session.event envelope around an inner upstream
+// notification, so tests can describe what the upstream agent emits.
+func eventFrame(sessionID, innerKind string, data json.RawMessage) dsh.RawBridgeEvent {
+	inner, _ := json.Marshal(map[string]any{"kind": innerKind, "data": data})
+	return dsh.RawBridgeEvent{Kind: "session.event", SessionID: sessionID, Event: inner}
+}
+
+func statusFrame(sessionID, status string) dsh.RawBridgeEvent {
+	return dsh.RawBridgeEvent{Kind: "session.status", SessionID: sessionID, Status: status}
+}
+
+func (s *scriptedBridge) handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, _ *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":     "ready",
+			"serverInfo": map[string]string{"name": "dsh-bridge-test", "version": "test"},
+		})
 	})
-	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
-		var req dsh.SessionRequest
+	mux.HandleFunc("POST /sessions", func(w http.ResponseWriter, r *http.Request) {
+		var req dsh.CreateSessionRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
-		id := "sess-" + req.Role
-		_ = json.NewEncoder(w).Encode(map[string]string{"id": id})
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"sessionId":  "sess-" + req.Model,
+			"serverInfo": map[string]string{"name": "dsh-bridge-test", "version": "test"},
+		})
 	})
-	mux.HandleFunc("/v1/sessions/", func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, "/v1/sessions/")
-		parts := strings.SplitN(path, "/", 2)
-		if len(parts) < 2 {
-			http.Error(w, "bad", http.StatusBadRequest)
-			return
-		}
-		sid, op := parts[0], parts[1]
-		switch op {
-		case "events":
-			s.mu.Lock()
-			evs := append([]dsh.RawEvent(nil), s.script[sid]...)
-			s.hits++
-			s.mu.Unlock()
-			w.Header().Set("Content-Type", "application/x-ndjson")
-			for _, e := range evs {
-				b, _ := json.Marshal(e)
-				_, _ = w.Write(b)
-				_, _ = w.Write([]byte("\n"))
+	mux.HandleFunc("POST /sessions/{id}/prompt", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"messageId": "msg-1"})
+	})
+	mux.HandleFunc("GET /sessions/{id}/events", func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		s.mu.Lock()
+		frames := append([]dsh.RawBridgeEvent(nil), s.script[id]...)
+		s.mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		for _, f := range frames {
+			b, _ := json.Marshal(f)
+			_, _ = w.Write([]byte("data: "))
+			_, _ = w.Write(b)
+			_, _ = w.Write([]byte("\n\n"))
+			if flusher != nil {
+				flusher.Flush()
 			}
-		default:
-			w.WriteHeader(http.StatusNoContent)
 		}
+	})
+	mux.HandleFunc("POST /sessions/{id}/close", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotImplemented)
 	})
 	return mux
 }
 
-func newRig(t *testing.T, script map[string][]dsh.RawEvent) (*agents.Runner, *scriptedDSH, storage.Repo, func()) {
+func newRig(t *testing.T, script map[string][]dsh.RawBridgeEvent) (*agents.Runner, storage.Repo, func()) {
 	t.Helper()
-	dshMock := newScriptedDSH()
-	dshMock.script = script
-	srv := httptest.NewServer(dshMock.handler())
-	c := dsh.NewClient(srv.URL)
+	mock := newScriptedBridge()
+	mock.script = script
+	srv := httptest.NewServer(mock.handler())
+	c := dsh.NewBridge(srv.URL)
 	repo, err := storage.OpenSQLite(":memory:")
 	if err != nil {
 		t.Fatal(err)
 	}
 	r := agents.New(c, repo)
+	r.Provider = "deepseek"
 	r.PollInterval = 5 * time.Millisecond
 	r.PollBudget = 500 * time.Millisecond
-	return r, dshMock, repo, func() { srv.Close(); _ = repo.Close() }
+	return r, repo, func() { srv.Close(); _ = repo.Close() }
 }
 
 func newRun(t *testing.T, repo storage.Repo, id string) domain.WorkflowRun {
@@ -101,12 +119,11 @@ func newRun(t *testing.T, repo storage.Repo, id string) domain.WorkflowRun {
 }
 
 func TestRunPersistsEventsAndReturnsAdvance(t *testing.T) {
-	r, _, repo, cleanup := newRig(t, map[string][]dsh.RawEvent{
-		"sess-scout": {
-			{SessionID: "sess-scout", Kind: "agent.started", At: time.Unix(1, 0).UTC(), Data: json.RawMessage(`{"role":"scout"}`)},
-			{SessionID: "sess-scout", Kind: "tool.completed", At: time.Unix(2, 0).UTC(), Data: json.RawMessage(`{"tool":"read"}`)},
-			{SessionID: "sess-scout", Kind: "agent.completed", At: time.Unix(3, 0).UTC(),
-				Data: json.RawMessage(`{"outcome":"advance","summary":"scout done"}`)},
+	r, repo, cleanup := newRig(t, map[string][]dsh.RawBridgeEvent{
+		"sess-deepseek-v3": {
+			eventFrame("sess-deepseek-v3", "agent.started", json.RawMessage(`{"role":"scout"}`)),
+			eventFrame("sess-deepseek-v3", "tool.completed", json.RawMessage(`{"tool":"read"}`)),
+			eventFrame("sess-deepseek-v3", "agent.completed", json.RawMessage(`{"outcome":"advance","summary":"scout done"}`)),
 		},
 	})
 	defer cleanup()
@@ -139,15 +156,14 @@ func TestRunPersistsEventsAndReturnsAdvance(t *testing.T) {
 }
 
 func TestRunReducesApprove(t *testing.T) {
-	r, _, repo, cleanup := newRig(t, map[string][]dsh.RawEvent{
-		"sess-gatekeeper": {
-			{SessionID: "sess-gatekeeper", Kind: "agent.completed", At: time.Unix(1, 0).UTC(),
-				Data: json.RawMessage(`{"outcome":"approve","summary":"ok"}`)},
+	r, repo, cleanup := newRig(t, map[string][]dsh.RawBridgeEvent{
+		"sess-m": {
+			eventFrame("sess-m", "agent.completed", json.RawMessage(`{"outcome":"approve","summary":"ok"}`)),
 		},
 	})
 	defer cleanup()
 	run := newRun(t, repo, "run-approve")
-	out, err := r.Run(context.Background(), run, "gatekeeper", "", agents.Instructions{Message: "review"})
+	out, err := r.Run(context.Background(), run, "gatekeeper", "m", agents.Instructions{Message: "review"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,14 +185,14 @@ func TestRunReducesReviseAndWaitUser(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r, _, repo, cleanup := newRig(t, map[string][]dsh.RawEvent{
-				"sess-x": {
-					{SessionID: "sess-x", Kind: "agent.completed", At: time.Unix(1, 0).UTC(), Data: json.RawMessage(tc.data)},
+			r, repo, cleanup := newRig(t, map[string][]dsh.RawBridgeEvent{
+				"sess-m": {
+					eventFrame("sess-m", "agent.completed", json.RawMessage(tc.data)),
 				},
 			})
 			defer cleanup()
 			run := newRun(t, repo, "run-"+tc.name)
-			out, err := r.Run(context.Background(), run, "x", "", agents.Instructions{Message: "go"})
+			out, err := r.Run(context.Background(), run, "x", "m", agents.Instructions{Message: "go"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -188,14 +204,38 @@ func TestRunReducesReviseAndWaitUser(t *testing.T) {
 }
 
 func TestRunErrorsWhenSessionIncomplete(t *testing.T) {
-	r, _, repo, cleanup := newRig(t, map[string][]dsh.RawEvent{
-		"sess-x": {
-			{SessionID: "sess-x", Kind: "agent.started", At: time.Unix(1, 0).UTC()},
+	r, repo, cleanup := newRig(t, map[string][]dsh.RawBridgeEvent{
+		"sess-m": {
+			eventFrame("sess-m", "agent.started", json.RawMessage(`{}`)),
 		},
 	})
 	defer cleanup()
 	run := newRun(t, repo, "run-timeout")
-	if _, err := r.Run(context.Background(), run, "x", "", agents.Instructions{}); err == nil {
+	if _, err := r.Run(context.Background(), run, "x", "m", agents.Instructions{}); err == nil {
 		t.Fatal("expected ErrSessionIncomplete")
+	}
+}
+
+func TestRunRejectsNilBridge(t *testing.T) {
+	repo, _ := storage.OpenSQLite(":memory:")
+	defer repo.Close()
+	r := agents.New(nil, repo)
+	r.Provider = "deepseek"
+	run := newRun(t, repo, "run-nil")
+	if _, err := r.Run(context.Background(), run, "x", "m", agents.Instructions{}); err == nil {
+		t.Fatal("expected nil bridge error")
+	}
+}
+
+func TestRunRequiresProvider(t *testing.T) {
+	srv := httptest.NewServer(newScriptedBridge().handler())
+	defer srv.Close()
+	repo, _ := storage.OpenSQLite(":memory:")
+	defer repo.Close()
+	r := agents.New(dsh.NewBridge(srv.URL), repo)
+	// Provider deliberately unset.
+	run := newRun(t, repo, "run-prov")
+	if _, err := r.Run(context.Background(), run, "x", "m", agents.Instructions{}); err == nil {
+		t.Fatal("expected missing-provider error")
 	}
 }

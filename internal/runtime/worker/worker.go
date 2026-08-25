@@ -5,7 +5,7 @@
 // worker is the runtime half of the engine; without it HTTP calls
 // create runs but nothing executes them.
 //
-// When cfg.DSHEndpoint is empty (no provider wired) the worker is
+// When cfg.DSHBridgeAddr is empty (no provider wired) the worker is
 // not started — the runtime remains a pure CRUD service which is
 // what unit tests and the smoke script rely on.
 package worker

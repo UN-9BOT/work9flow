@@ -72,7 +72,7 @@ id = "test"
 		t.Fatal(err)
 	}
 	defer repo.Close()
-	c := dsh.NewClient(srv.URL)
+	c := dsh.NewBridge(srv.URL)
 	ar := agents.New(c, repo)
 	ar.PollInterval = 5 * time.Millisecond
 	ar.PollBudget = 500 * time.Millisecond

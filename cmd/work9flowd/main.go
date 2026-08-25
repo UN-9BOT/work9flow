@@ -76,18 +76,18 @@ func main() {
 	var (
 		eng      *engine.Engine
 		ar       *agents.Runner
-		inlineDS *httptest.Server // for shutdown when DSHEndpoint == ""
+		inlineDS *httptest.Server // for shutdown when DSHBridgeAddr == ""
 	)
-	if cfg.DSHEndpoint != "" {
-		c := dsh.NewClient(cfg.DSHEndpoint)
+	if cfg.DSHBridgeAddr != "" {
+		c := dsh.NewBridge(cfg.DSHBridgeAddr)
 		hcCtx, hcCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		st, err := c.Health(hcCtx)
 		hcCancel()
 		if err != nil {
 			logger.Warn("DSH unreachable; engine+worker disabled",
-				"endpoint", cfg.DSHEndpoint, "err", err)
+				"endpoint", cfg.DSHBridgeAddr, "err", err)
 		} else {
-			logger.Info("DSH reachable", "endpoint", cfg.DSHEndpoint, "status", st)
+			logger.Info("DSH reachable", "endpoint", cfg.DSHBridgeAddr, "status", st)
 			ar = agents.New(c, repo)
 		}
 	} else if cfg.ProvidersFile != "" {
@@ -111,7 +111,7 @@ func main() {
 			logger.Fatal("start inline DSH", "err", srvErr)
 		}
 		inlineDS = srv
-		c := dsh.NewClient(srv.URL)
+		c := dsh.NewBridge(srv.URL)
 		logger.Info("inline DSH started",
 			"endpoint", srv.URL,
 			"provider", defaultRef.Provider,

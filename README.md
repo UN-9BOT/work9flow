@@ -74,14 +74,14 @@ SQLite database: `<state_dir>/work9flow.db`.
 
 1. `Defaults()` (`http://127.0.0.1:7469`, XDG state dir).
 2. YAML: `--config work9flow.yaml`.
-3. ENV: `WORK9FLOW_STATE_DIR`, `WORK9FLOW_RUNTIME_ENDPOINT`, `WORK9FLOW_DSH_ENDPOINT`, `WORK9FLOW_WORKSPACE_DIR`, `WORK9FLOW_PROVIDERS_FILE`.
+3. ENV: `WORK9FLOW_STATE_DIR`, `WORK9FLOW_RUNTIME_ENDPOINT`, `WORK9FLOW_DSH_BRIDGE_ADDR`, `WORK9FLOW_WORKSPACE_DIR`, `WORK9FLOW_PROVIDERS_FILE`.
 
 `work9flow.yaml` пример:
 
 ```yaml
 state_dir: ~/.local/state/work9flow
 runtime_endpoint: http://127.0.0.1:7469
-# dsh_endpoint: http://127.0.0.1:7770   # опционально: внешний DSH (Node)
+# dsh_bridge_addr: http://127.0.0.1:7770   # опционально: внешний DSH (Node)
 providers_file: ./providers.toml         # альтернана — поднять inline DSH
 iteration_limits:
   default: 5
@@ -93,7 +93,7 @@ model_roles:
 ## Провайдеры (`providers.toml`)
 
 `providers.toml` описывает LLM-провайдеров с OpenAI-совместимым API.
-Файл подгружается при старте `work9flowd`, когда `dsh_endpoint` пуст —
+Файл подгружается при старте `work9flowd`, когда `dsh_bridge_addr` пуст —
 демон сам поднимает маленький DSH-совместимый HTTP-сервер, который
 перенаправляет сессии в указанный провайдер. Это позволяет гонять
 полный feature-development pipeline (scout → planner → gatekeeper →

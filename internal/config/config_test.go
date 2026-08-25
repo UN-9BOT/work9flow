@@ -35,7 +35,7 @@ func TestLoadFromYAML(t *testing.T) {
 	path := filepath.Join(dir, "work9flow.yaml")
 	yaml := `state_dir: /tmp/wf-state
 runtime_endpoint: http://127.0.0.1:9000
-dsh_endpoint: http://127.0.0.1:8011
+dsh_bridge_addr: http://127.0.0.1:8011
 workspace_dir: /tmp/wf-ws
 iteration_limits:
   default: 3
@@ -68,7 +68,7 @@ model_roles:
 func TestLoadEnvOverrides(t *testing.T) {
 	t.Setenv("WORK9FLOW_STATE_DIR", "/env/state")
 	t.Setenv("WORK9FLOW_RUNTIME_ENDPOINT", "http://127.0.0.1:5555")
-	t.Setenv("WORK9FLOW_DSH_ENDPOINT", "http://127.0.0.1:6666")
+	t.Setenv("WORK9FLOW_DSH_BRIDGE_ADDR", "http://127.0.0.1:6666")
 
 	cfg, err := Load("")
 	if err != nil {
@@ -80,8 +80,8 @@ func TestLoadEnvOverrides(t *testing.T) {
 	if cfg.RuntimeEndpoint != "http://127.0.0.1:5555" {
 		t.Errorf("RuntimeEndpoint = %q", cfg.RuntimeEndpoint)
 	}
-	if cfg.DSHEndpoint != "http://127.0.0.1:6666" {
-		t.Errorf("DSHEndpoint = %q", cfg.DSHEndpoint)
+	if cfg.DSHBridgeAddr != "http://127.0.0.1:6666" {
+		t.Errorf("DSHBridgeAddr = %q", cfg.DSHBridgeAddr)
 	}
 }
 

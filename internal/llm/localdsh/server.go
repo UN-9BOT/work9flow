@@ -4,19 +4,19 @@
 // Node process — useful for local smoke testing and as a reference for
 // future providers.
 //
-// Wire compatibility:
+// Wire compatibility (mirrors runtime/dsh-bridge HTTP surface):
 //
-//	POST /v1/sessions                 {role, model}        -> {id}
-//	POST /v1/sessions/{id}/followup   {message, data}      -> 204
-//	POST /v1/sessions/{id}/steer      {message, data}      -> 204
-//	POST /v1/sessions/{id}/cancel                           -> 204
-//	GET  /v1/sessions/{id}/events                          -> ndjson event stream
-//	GET  /v1/health                                          -> {status:"ok"}
+//	POST /sessions                       {cwd, provider, model, maxTokens?} -> {sessionId, serverInfo}
+//	POST /sessions/{id}/prompt           {contentBlocks}                   -> {messageId}
+//	POST /sessions/{id}/close                                                 -> 501 not_supported
+//	POST /shutdown                                                           -> 204
+//	GET  /sessions/{id}/events                                              -> SSE stream of session.event/session.status/subagent.* frames
+//	GET  /health                                                             -> {status, serverInfo, message}
 //
-// When /events is first polled after a followup, the server kicks off
+// When /events is opened after a prompt, the server kicks off
 // a single OpenAI chat completion (model = session.Model, role prompt
 // derived from role + the stored followup message) and emits one
-// `agent.completed` event whose data contains
+// session.event with kind=agent.completed and data containing
 //
 //	{"outcome":"<parsed>","summary":"<model text>","raw":"<model text>"}
 //
@@ -53,14 +53,14 @@ type Provider struct {
 // Session is one in-flight role run.
 type Session struct {
 	ID        string
-	Role      string
+	Cwd       string
+	Provider  string
 	Model     string
 	CreatedAt time.Time
 
 	mu          sync.Mutex
 	lastMessage string
 	completed   bool
-	canceled    bool
 	completion  *completion
 }
 
@@ -105,124 +105,127 @@ func New(provider Provider) (*Server, error) {
 // Handler returns the HTTP handler for the server.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/health", s.health)
-	mux.HandleFunc("/v1/sessions", s.createSession)
-	mux.HandleFunc("/v1/sessions/", s.sessionSub)
+	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("POST /sessions", s.handleCreateSession)
+	mux.HandleFunc("POST /sessions/{id}/prompt", s.handlePrompt)
+	mux.HandleFunc("POST /sessions/{id}/close", s.handleClose)
+	mux.HandleFunc("GET /sessions/{id}/events", s.handleEvents)
+	mux.HandleFunc("POST /shutdown", s.handleShutdown)
 	return mux
 }
 
-func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
-	_, _ = w.Write([]byte(`{"status":"ok"}`))
+func (s *Server) lookup(id string) (*Session, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[id]
+	return sess, ok
 }
 
-func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"status":"ready","serverInfo":{"name":"localdsh","version":"test"}}`))
+}
+
+func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Role  string `json:"role"`
-		Model string `json:"model"`
+		Cwd       string `json:"cwd"`
+		Provider  string `json:"provider"`
+		Model     string `json:"model"`
+		MaxTokens *int   `json:"maxTokens,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
-	if body.Role == "" {
-		http.Error(w, "role required", http.StatusBadRequest)
+	if body.Provider == "" {
+		http.Error(w, "provider required", http.StatusBadRequest)
 		return
+	}
+	if body.Model == "" {
+		body.Model = s.Provider.Model
+	}
+	if body.Cwd == "" {
+		body.Cwd = "/"
 	}
 	sess := &Session{
 		ID:        "sess-" + uuid.NewString(),
-		Role:      body.Role,
-		Model:     firstNonEmpty(body.Model, s.Provider.Model),
+		Cwd:       body.Cwd,
+		Provider:  body.Provider,
+		Model:     body.Model,
 		CreatedAt: time.Now().UTC(),
 	}
 	s.mu.Lock()
 	s.sessions[sess.ID] = sess
 	s.mu.Unlock()
-	_ = json.NewEncoder(w).Encode(map[string]string{"id": sess.ID})
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"sessionId":  sess.ID,
+		"serverInfo": map[string]string{"name": "localdsh", "version": "test"},
+	})
 }
 
-func (s *Server) sessionSub(w http.ResponseWriter, r *http.Request) {
-	parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/v1/sessions/"), "/", 2)
-	if len(parts) != 2 {
-		http.Error(w, "bad path", http.StatusBadRequest)
-		return
-	}
-	id, op := parts[0], parts[1]
-	s.mu.Lock()
-	sess, ok := s.sessions[id]
-	s.mu.Unlock()
+func (s *Server) handlePrompt(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sess, ok := s.lookup(id)
 	if !ok {
 		http.Error(w, "no such session", http.StatusNotFound)
 		return
 	}
-	switch op {
-	case "followup":
-		s.followup(w, r, sess)
-	case "steer":
-		s.steer(w, r, sess)
-	case "cancel":
-		s.cancel(w, r, sess)
-	case "events":
-		s.events(w, r, sess)
-	default:
-		http.Error(w, "unknown op", http.StatusNotFound)
-	}
-}
-
-func (s *Server) followup(w http.ResponseWriter, r *http.Request, sess *Session) {
 	var body struct {
-		Message string          `json:"message"`
-		Data    json.RawMessage `json:"data"`
+		ContentBlocks []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"contentBlocks"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad json", http.StatusBadRequest)
 		return
 	}
+	var msg string
+	for _, b := range body.ContentBlocks {
+		if b.Type == "text" {
+			msg += b.Text
+		}
+	}
 	sess.mu.Lock()
-	sess.lastMessage = body.Message
+	sess.lastMessage = msg
 	sess.completed = false
 	sess.completion = nil
 	sess.mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"messageId": "msg-" + sess.ID})
+}
+
+func (s *Server) handleClose(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotImplemented)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error":  "not_supported",
+		"detail": "upstream DSH SDK has no per-session close; shutdown the runtime instead",
+	})
+}
+
+func (s *Server) handleShutdown(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) steer(w http.ResponseWriter, _ *http.Request, sess *Session) {
+// handleEvents streams the session's normalized event log. When the
+// session has not yet completed, this call kicks off the OpenAI request
+// and blocks (up to 25s) until the model responds. The response is a
+// single session.event with kind=agent.completed, followed by
+// session.status=idle.
+func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	sess, ok := s.lookup(id)
+	if !ok {
+		http.Error(w, "no such session", http.StatusNotFound)
+		return
+	}
 	sess.mu.Lock()
-	sess.lastMessage += "\n[steer]"
-	sess.mu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *Server) cancel(w http.ResponseWriter, _ *http.Request, sess *Session) {
-	sess.mu.Lock()
-	sess.canceled = true
-	sess.mu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// events streams the session's normalized event log. When the session
-// has not yet completed, this call kicks off the OpenAI request and
-// blocks (up to 25s) until the model responds or the session is
-// canceled. The response is a single agent.completed ndjson line.
-func (s *Server) events(w http.ResponseWriter, r *http.Request, sess *Session) {
-	sess.mu.Lock()
-	canceled := sess.canceled
 	last := sess.lastMessage
 	done := sess.completed
 	sess.mu.Unlock()
 
-	if canceled {
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"session_id": sess.ID,
-			"kind":       "session.canceled",
-			"at":         time.Now().UTC(),
-		})
-		return
-	}
 	if !done {
 		s.runCompletion(sess, last)
 	}
@@ -233,7 +236,9 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request, sess *Session) {
 		http.Error(w, "no completion", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
 	payload := map[string]any{
 		"outcome": c.outcome,
 		"summary": c.summary,
@@ -243,12 +248,24 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request, sess *Session) {
 		payload["error"] = c.err
 		payload["outcome"] = "failed"
 	}
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"session_id": sess.ID,
-		"kind":       "agent.completed",
-		"at":         time.Now().UTC(),
-		"data":       payload,
+	eventJSON, _ := json.Marshal(map[string]any{
+		"kind":      "session.event",
+		"sessionId": sess.ID,
+		"event": map[string]any{
+			"kind": "agent.completed",
+			"data": payload,
+		},
 	})
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", eventJSON)
+	statusJSON, _ := json.Marshal(map[string]any{
+		"kind":      "session.status",
+		"sessionId": sess.ID,
+		"status":    "idle",
+	})
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", statusJSON)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func (s *Server) runCompletion(sess *Session, prompt string) {
@@ -259,7 +276,7 @@ func (s *Server) runCompletion(sess *Session, prompt string) {
 		s.completeWithError(sess, err)
 		return
 	}
-	sys := roleSystemPrompt(sess.Role)
+	sys := roleSystemPrompt(sess.Provider)
 	resp, err := c.ChatCompletions(ctx, openai.Request{
 		Model: sess.Model,
 		Messages: []openai.Message{
@@ -335,11 +352,4 @@ func oneLineSummary(text string) string {
 		text = text[:240] + "..."
 	}
 	return text
-}
-
-func firstNonEmpty(a, b string) string {
-	if a != "" {
-		return a
-	}
-	return b
 }
