@@ -76,11 +76,14 @@ process + dependency layout this section assumes.
 5. **no-fork-no-vendor** — never fork the upstream DSH SDK; never
    vendor a third-party SDK in lieu of upstream. Upstream-version
    pinning is the supported upgrade path (see rule 14).
-6. **artifact-protocol** — agents emit artifacts as structured
-   `ArtifactPayload{Kind,Name,Stage,Content|ContentRef,Metadata}`
-   inside `agent.completed.data.artifacts`. The engine persists via
-   `storage.AddArtifact`; downstream stages consume via
-   `storage.ListArtifacts`. No agent speaks file paths in messages.
+6. **artifact-protocol** — cross-stage data is carried by
+   durable versioned artifacts, persisted by the engine via
+   `storage.AddArtifact` and consumed by downstream stages via
+   `storage.ListArtifacts`. Artifact content MAY contain
+   repo-relative paths and symbol references — that is the
+   work9flow contract, not a property of any specific DSH event
+   vocabulary (mocks that bind artifacts to a particular upstream
+   event field are forbidden).
 7. **immutable-task** — `WorkflowRun.OriginalTask` and `RepoPath`
    are set at create-time and never mutated afterwards. Any
    re-scoping is a NEW run.
@@ -99,10 +102,12 @@ process + dependency layout this section assumes.
     domain.Attention with status=OPEN before the run stops
     advancing. Attention close resumes the run, not raw
     `outcome=advance`.
-11. **explicit-next-stage** — every `StageDef.Transition` returns
-    the explicit next `domain.RunState`. No fall-through, no default
-    "next in slice", no inferred ordering. The engine rejects an
-    unknown state.
+11. **explicit-next-stage** — every transition names an
+    explicit next workflow stage id or a terminal outcome. Never
+    derive the next step from `RunState` or map order; otherwise a
+    generic multi-workflow engine re-binds to one workflow's
+    feature-development states. The engine rejects a transition
+    that does not name a known stage id or terminal outcome.
 12. **persisted-then-published** — events are appended to storage
     BEFORE the WS publish is attempted (`storage.AppendEvent` is
     the source of truth). Publish is best-effort; replay covers

@@ -29,7 +29,7 @@ import {
   type HarnessClientOptions,
   type HarnessNotification,
 } from '@deepseek-ai/dsh-sdk-client'
-import { spawnRuntime, type LaunchSpec } from './launcher.js'
+import { resolveLaunch, type LaunchSpec } from './launcher.js'
 import type {
   BridgeEvent,
   CreateSessionRequest,
@@ -110,10 +110,15 @@ export class Bridge {
     })
   }
 
-  /** Resolve the LaunchSpec into HarnessClientOptions (real path). */
+  /**
+   * Resolve the LaunchSpec into HarnessClientOptions. Pure resolver —
+   * the upstream HarnessClient owns the child process lifecycle and
+   * spawns the dsh-jsonrpc-agent itself. The bridge never spawns
+   * directly, so exactly one process is started per runtime.
+   */
   private resolveLaunchOpts(): HarnessClientOptions {
     if (!this.opts.launch) throw new Error('bridge launch spec missing')
-    const { resolved } = spawnRuntime(this.opts.launch)
+    const resolved = resolveLaunch(this.opts.launch)
     return {
       command: resolved.command,
       args: resolved.args,
@@ -300,7 +305,17 @@ export class Bridge {
           res.write(`data: ${JSON.stringify(ev)}\n\n`)
         }
       } catch (err) {
-        try { res.write(`data: ${JSON.stringify({ kind: 'bridge.error', message: String(err) } satisfies BridgeEvent)}\n\n`) } catch {}
+        // Pump failure is a transport-level error, NOT a domain event.
+        // Skip the spurious `bridge.error` SSE frame (it would land as
+        // raw.passthrough on the Go side and the Runner would keep
+        // polling instead of surfacing the failure). Just close the
+        // stream; Go's scanner.Err() will report the original error
+        // through errCh.
+        if (this.subscribers.has(subId)) {
+          this.subscribers.delete(subId)
+        }
+        // Best-effort log; in production this goes to stderr logger.
+        try { (this.opts as { onError?: (e: unknown) => void }).onError?.(err) } catch {}
       } finally {
         subscription.close()
         this.subscribers.delete(subId)

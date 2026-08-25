@@ -16,7 +16,6 @@
  * This module is intentionally tiny: it does NOT inspect the runtime's
  * stdio (that is the SDK client's job). It only picks the argv tuple.
  */
-import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 
@@ -91,18 +90,4 @@ export function resolveLaunch(spec: LaunchSpec): ResolvedLaunch {
     env: spec.env,
     mode: 'exe',
   }
-}
-
-/**
- * Spawn the runtime subprocess. Returns the ChildProcess; the caller owns
- * its stdio. The SDK client will speak newline-delimited JSON-RPC over it.
- */
-export function spawnRuntime(spec: LaunchSpec): { child: ChildProcess; resolved: ResolvedLaunch } {
-  const resolved = resolveLaunch(spec)
-  const child = spawn(resolved.command, resolved.args, {
-    cwd: resolved.cwd,
-    env: resolved.env ?? process.env,
-    stdio: ['pipe', 'pipe', 'pipe'],
-  })
-  return { child, resolved }
 }

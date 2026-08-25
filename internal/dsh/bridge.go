@@ -195,21 +195,33 @@ func (r *RawBridgeEvent) eventData() json.RawMessage {
 // There is NO Steer / Followup / Cancel method. Upstream DSH has no
 // wire-level cancel; abandoning a turn means closing the runtime.
 type Bridge struct {
-	baseURL string
-	hc      *http.Client
+	baseURL    string
+	// hc handles unary calls (Health / CreateSession / Prompt /
+	// CloseSession / Shutdown). It has a bounded total Timeout so a
+	// hung bridge cannot pin a goroutine forever.
+	hc         *http.Client
+	// streamHC handles the SSE Events stream. It has NO overall
+	// Timeout because long-lived real-DSH agent runs exceed any
+	// reasonable per-call deadline; lifecycle is owned by the
+	// request context and ctx-cancel observed in readSSE.
+	streamHC   *http.Client
 }
 
 // NewBridge constructs a Bridge pointed at the dsh-bridge HTTP API.
 // baseURL is the bridge root, e.g. "http://127.0.0.1:7777".
 func NewBridge(baseURL string) *Bridge {
 	return &Bridge{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		hc:      &http.Client{Timeout: 10 * time.Second},
+		baseURL:  strings.TrimRight(baseURL, "/"),
+		hc:       &http.Client{Timeout: 10 * time.Second},
+		streamHC: &http.Client{}, // no Timeout: SSE stream is long-lived
 	}
 }
 
 // SetHTTPClient overrides the default HTTP client (for tests).
 func (b *Bridge) SetHTTPClient(hc *http.Client) { b.hc = hc }
+
+// SetStreamHTTPClient overrides the streaming HTTP client (for tests).
+func (b *Bridge) SetStreamHTTPClient(hc *http.Client) { b.streamHC = hc }
 
 // Health probes the bridge. Returns the bridge status (starting/ready/closed).
 func (b *Bridge) Health(ctx context.Context) (HealthStatus, error) {
@@ -308,7 +320,7 @@ func (b *Bridge) Events(ctx context.Context, sessionID string) (<-chan Normalize
 		return evCh, errCh
 	}
 	req.Header.Set("Accept", "text/event-stream")
-	resp, err := b.hc.Do(req)
+	resp, err := b.streamHC.Do(req)
 	if err != nil {
 		errCh <- err; close(evCh); close(errCh)
 		return evCh, errCh
