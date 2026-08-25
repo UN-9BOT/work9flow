@@ -8,5 +8,10 @@
 # Go build artifacts
 /cmd/*/work9flowd
 /cmd/*/work9flow
+/work9flowd
+/work9flow
 *.test
 *.out
+
+# Local smoke test state
+.work9flow-smoke/

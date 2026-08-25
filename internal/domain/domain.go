@@ -50,7 +50,7 @@ func CanTransition(from, to RunState) bool {
 	}
 	switch from {
 	case RunNew:
-		return to == RunDiscovery
+		return to == RunDiscovery || to == RunCanceled || to == RunFailed
 	case RunDiscovery:
 		return to == RunPlanning || to == RunFailed || to == RunCanceled
 	case RunPlanning:

@@ -1,5 +1,5 @@
 // work9flowd is the work9flow runtime/controller. It owns the local
-// HTTP protocol surface, durable state and (eventually) the DSH
+// HTTP protocol surface, durable state, and (eventually) the DSH
 // adapter. The TUI is a separate process that connects to it.
 package main
 
@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -18,9 +19,10 @@ import (
 	"github.com/unbot/work9flow/internal/dsh"
 	"github.com/unbot/work9flow/internal/protocol"
 	"github.com/unbot/work9flow/internal/runtime"
+	"github.com/unbot/work9flow/internal/storage"
 
 	// Blank imports pin the planned Charm stack in go.mod. Live
-	// callers land with MVP 02+; see README.md for the role of each.
+	// callers land with MVP 03+; see README.md for the role of each.
 	_ "github.com/catppuccin/go"
 	_ "github.com/charmbracelet/bubbletea"
 	_ "github.com/charmbracelet/glamour"
@@ -50,8 +52,19 @@ func main() {
 	if listen == "" {
 		listen = cfg.RuntimeEndpoint
 	}
-	// Config value may be "http://host:port" or "host:port"; strip scheme.
-		listen = stripScheme(listen)
+	listen = stripScheme(listen)
+
+	// Ensure the state directory exists before opening SQLite.
+	if err := os.MkdirAll(cfg.StateDir, 0o755); err != nil {
+		logger.Fatal("create state dir", "dir", cfg.StateDir, "err", err)
+	}
+	dbPath := filepath.Join(cfg.StateDir, "work9flow.db")
+	repo, err := storage.OpenSQLite(dbPath)
+	if err != nil {
+		logger.Fatal("open storage", "path", dbPath, "err", err)
+	}
+	defer func() { _ = repo.Close() }()
+	logger.Info("storage ready", "path", dbPath)
 
 	if cfg.DSHEndpoint != "" {
 		c := dsh.NewClient(cfg.DSHEndpoint)
@@ -67,6 +80,7 @@ func main() {
 		Version: protocol.Version,
 		Addr:    listen,
 		Logger:  logger,
+		Repo:    repo,
 	})
 
 	ln, err := srv.Listen()
