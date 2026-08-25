@@ -1,11 +1,12 @@
 /**
- * Bridge HTTP layer tests using a fake DeepSeekHarness.
+ * Bridge HTTP layer tests using a fake BridgeRuntime.
  *
  * The fake implements the small surface our bridge actually calls:
  *   - start(): Promise<void>
  *   - close(): Promise<void>
  *   - client.prompt(sessionId, blocks): Promise<{messageId}>
  *   - client.subscribeSessionTree(id): async iterable of notifications
+ *   - serverInfo: { name, version } — exposed honestly on /health and /sessions
  *
  * No real DSH runtime required.
  */
@@ -18,12 +19,11 @@ import {
 } from '../src/server.ts'
 import type {
   ContentBlock,
-  DeepSeekHarness,
-  DeepSeekHarnessOptions,
   HarnessClient,
   HarnessNotification,
   NotificationSubscription,
 } from '@deepseek-ai/dsh-sdk-client'
+import type { BridgeRuntime } from '../src/server.ts'
 
 interface FakeSubscription extends NotificationSubscription {
   push(n: HarnessNotification): void
@@ -71,11 +71,12 @@ function makeFakeSubscription(): FakeSubscription {
   return sub
 }
 
-function makeFakeHarness(opts: {
+function makeFakeRuntime(opts: {
   onPrompt?: (id: string, blocks: ContentBlock[]) => string
   onSubscribe?: (id: string) => FakeSubscription
   startShouldThrow?: boolean
-}): DeepSeekHarness {
+  serverInfo?: { name: string; version: string }
+}): BridgeRuntime {
   const subscriptions = new Map<string, FakeSubscription>()
   let messageCounter = 0
   const client = {
@@ -94,18 +95,14 @@ function makeFakeHarness(opts: {
     },
   } as unknown as HarnessClient
 
-  const harness: DeepSeekHarness = {
+  return {
+    client,
+    serverInfo: opts.serverInfo ?? { name: 'unknown', version: 'unknown' },
     start: async () => {
       if (opts.startShouldThrow) throw new Error('handshake_failed')
     },
     close: async () => {},
-    run: (() => { throw new Error('not used in test') }) as never,
-    session: (() => { throw new Error('not used in test') }) as never,
-    client,
-    [Symbol.asyncDispose]: async () => {},
-  } as unknown as DeepSeekHarness
-
-  return harness
+  }
 }
 
 async function jsonPost(url: string, body: unknown): Promise<{ status: number; json: any }> {
@@ -154,13 +151,10 @@ async function readSSE(url: string, signal: AbortSignal): Promise<HarnessNotific
 }
 
 test('POST /sessions returns a sessionId and persists state', async () => {
-  const harness = makeFakeHarness({})
-  let receivedOpts: DeepSeekHarnessOptions | undefined
-  const factory = (opts: DeepSeekHarnessOptions) => {
-    receivedOpts = opts
-    return harness
-  }
-  const bridge = new Bridge({ port: 0, harnessFactory: factory })
+  const runtime = makeFakeRuntime({})
+  let receivedReq: unknown = undefined
+  const factory = (req: unknown) => { receivedReq = req; return runtime }
+  const bridge = new Bridge({ port: 0, runtimeFactory: factory })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
@@ -170,14 +164,15 @@ test('POST /sessions returns a sessionId and persists state', async () => {
   })
   assert.equal(r.status, 200)
   assert.ok(typeof r.json.sessionId === 'string' && r.json.sessionId.length > 0)
-  assert.ok(receivedOpts, 'factory should receive opts')
-  assert.equal(receivedOpts!.provider, 'deepseek-official')
+  assert.ok(receivedReq, 'factory should receive request')
+  const receivedBody = receivedReq as { provider?: string; cwd?: string; model?: string }
+  assert.equal(receivedBody.provider, 'deepseek-official')
 
   await bridge.close()
 })
 
 test('POST /sessions 400 on missing fields', async () => {
-  const bridge = new Bridge({ port: 0, harnessFactory: () => makeFakeHarness({}) })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => makeFakeRuntime({}) })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
@@ -192,10 +187,10 @@ test('POST /sessions 400 on missing fields', async () => {
 test('POST /sessions/:id/prompt returns messageId from upstream', async () => {
   let lastId = ''
   let lastBlocks: ContentBlock[] = []
-  const harness = makeFakeHarness({
+  const harness = makeFakeRuntime({
     onPrompt: (id, blocks) => { lastId = id; lastBlocks = blocks; return 'msg-42' },
   })
-  const bridge = new Bridge({ port: 0, harnessFactory: () => harness })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => harness })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
@@ -214,7 +209,7 @@ test('POST /sessions/:id/prompt returns messageId from upstream', async () => {
 })
 
 test('POST /sessions/:id/prompt 404 on unknown session', async () => {
-  const bridge = new Bridge({ port: 0, harnessFactory: () => makeFakeHarness({}) })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => makeFakeRuntime({}) })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
@@ -226,7 +221,7 @@ test('POST /sessions/:id/prompt 404 on unknown session', async () => {
 })
 
 test('POST /sessions/:id/close returns 501 (upstream has no per-session close)', async () => {
-  const bridge = new Bridge({ port: 0, harnessFactory: () => makeFakeHarness({}) })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => makeFakeRuntime({}) })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
@@ -240,14 +235,14 @@ test('POST /sessions/:id/close returns 501 (upstream has no per-session close)',
 test('GET /sessions/:id/events streams upstream notifications as SSE', async () => {
   const subs = new Map<string, FakeSubscription>()
   const make = () => makeFakeSubscription()
-  const harness = makeFakeHarness({
+  const harness = makeFakeRuntime({
     onSubscribe: (id) => {
       let s = subs.get(id)
       if (!s) { s = make(); subs.set(id, s) }
       return s
     },
   })
-  const bridge = new Bridge({ port: 0, harnessFactory: () => harness })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => harness })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
@@ -288,7 +283,7 @@ test('GET /sessions/:id/events streams upstream notifications as SSE', async () 
 })
 
 test('GET /health reflects lifecycle', async () => {
-  const bridge = new Bridge({ port: 0, harnessFactory: () => makeFakeHarness({}) })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => makeFakeRuntime({}) })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
@@ -303,15 +298,70 @@ test('GET /health reflects lifecycle', async () => {
   await bridge.close()
 })
 
+test('GET /health and POST /sessions surface the runtime-reported serverInfo (not fabricated)', async () => {
+  // The previous bridge fabricated `{ name: 'deepseek-harness-sdk-runtime', version: '0.0.1' }`
+  // for /health and /sessions regardless of the actual runtime. Now the
+  // runtimeFactory's serverInfo is surfaced honestly. The runtime is
+  // created lazily on first /sessions, so we POST first, then /health.
+  const wire = { name: 'deepseek-harness-sdk-runtime', version: '0.4.2-rc.7' }
+  const bridge = new Bridge({
+    port: 0,
+    runtimeFactory: () => makeFakeRuntime({ serverInfo: wire }),
+  })
+  await bridge.listen()
+  const addr = (bridge as any).server.address()
+  const base = `http://127.0.0.1:${addr.port}`
+
+  // Before any /sessions, the bridge has not initialised the runtime;
+  // /health reports `starting` and omits serverInfo.
+  const h0 = await (await fetch(`${base}/health`)).json() as any
+  assert.equal(h0.status, 'starting')
+  assert.equal(h0.serverInfo, undefined, 'must not fabricate serverInfo when runtime not ready')
+
+  const r = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.json.serverInfo, wire, 'sessions must report runtime-supplied serverInfo')
+
+  const h = await (await fetch(`${base}/health`)).json() as any
+  assert.equal(h.status, 'ready')
+  assert.deepEqual(h.serverInfo, wire, 'health must report runtime-supplied serverInfo')
+
+  await bridge.close()
+})
+
+test('GET /health without serverInfo when runtime has not initialised (status: starting)', async () => {
+  // We force the bridge into the starting-but-no-runtime state by never
+  // creating a session. The default runtimeFactory would spawn a real
+  // process, so we inject one that throws on start() — that path leaves
+  // `this.runtime` undefined and the bridge reports `status: starting`
+  // with no serverInfo.
+  const bridge = new Bridge({
+    port: 0,
+    runtimeFactory: () => makeFakeRuntime({ startShouldThrow: true }),
+  })
+  await bridge.listen()
+  const addr = (bridge as any).server.address()
+  const base = `http://127.0.0.1:${addr.port}`
+
+  // /health before any session — runtime is undefined → status=starting, no serverInfo.
+  const h = await (await fetch(`${base}/health`)).json() as any
+  assert.equal(h.status, 'starting')
+  assert.equal(h.serverInfo, undefined, 'must not fabricate serverInfo when runtime not ready')
+
+  // POST /sessions will fail (start throws) — we just want to assert no
+  // crash on the health path itself.
+  await bridge.close()
+})
+
 test('POST /shutdown returns 204', async () => {
   // We deliberately do NOT assert harness.close() was called here: that
   // happens async after res.end() and server.close() completes, which
   // is observable behaviour rather than a contract. The 204 + server
   // no longer accepting new connections is what we promise to the caller.
   let startCalled = false
-  const harness = makeFakeHarness({})
-  ;(harness as any).start = async () => { startCalled = true }
-  const bridge = new Bridge({ port: 0, harnessFactory: () => harness })
+  const runtime = makeFakeRuntime({})
+  ;(runtime as any).start = async () => { startCalled = true }
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`

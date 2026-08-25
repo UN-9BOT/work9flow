@@ -2,10 +2,10 @@
  * The dsh-bridge HTTP server.
  *
  * Owns ONE dsh-jsonrpc-agent subprocess per process (per upstream
- * DeepSeekHarness semantics: one initialize pins cwd/provider/model for
+ * HarnessClient semantics: one initialize pins cwd/provider/model for
  * the runtime's lifetime). Multiple sessions can share the same runtime;
- * each session gets its own `HarnessSession.handle` and its own
- * subscription via `client.subscribeSessionTree(id)`.
+ * each session gets its own subscription via
+ * `client.subscribeSessionTree(id)`.
  *
  * For work9flow's per-AgentRun ownership model (4v1.11) we will spawn
  * one bridge process per AgentRun — this MVP keeps one bridge = one
@@ -17,18 +17,22 @@
  *   - SSE streams only upstream notifications (session.event, session.status,
  *     subagent.started, subagent.finished). No agent/* fan-out, no stealth
  *     steering. The Go client maps these to work9flow domain events.
+ *   - serverInfo on /health and /sessions is the value the runtime
+ *     actually returned in its `initialize` handshake. We never fabricate
+ *     name/version; if the handshake has not yet completed we report
+ *     `{ name: 'unknown', version: 'unknown' }` so callers can tell the
+ *     gap from a real identity.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { resolve as resolvePath } from 'node:path'
 import {
-  DeepSeekHarness,
   HarnessClient,
   type ContentBlock,
-  type DeepSeekHarnessOptions,
   type HarnessClientOptions,
   type HarnessNotification,
 } from '@deepseek-ai/dsh-sdk-client'
+import type { InitializeResult } from '@deepseek-ai/dsh-sdk-protocol'
 import { resolveLaunch, type LaunchSpec } from './launcher.js'
 import type {
   BridgeEvent,
@@ -40,23 +44,47 @@ import type {
   SubagentStopReason,
 } from './types.js'
 
+/** Unknown serverInfo when the runtime handshake has not yet completed. */
+const UNKNOWN_SERVER_INFO: { name: string; version: string } = {
+  name: 'unknown',
+  version: 'unknown',
+}
+
+/**
+ * The small surface the bridge actually drives. We use HarnessClient
+ * directly (not the high-level DeepSeekHarness) so the bridge can
+ * capture the wire-stable `InitializeResult.serverInfo` and surface it
+ * honestly. Tests inject a fake via `runtimeFactory`.
+ */
+export interface BridgeRuntime {
+  /** Run the spawn + initialize handshake. Called once at first session. */
+  start(): Promise<void>
+  /** Underlying JSON-RPC client. The bridge calls prompt / subscribe on it. */
+  readonly client: HarnessClient
+  /** Wire-stable server identity reported by the runtime's `initialize` reply. */
+  readonly serverInfo: { name: string; version: string }
+  /** Tear down the runtime process. Idempotent. */
+  close(): Promise<void>
+}
+
 export interface BridgeOptions {
   /** Port to listen on. */
   port: number
   /** Host to bind. Default '127.0.0.1' — the bridge is local-only. */
   host?: string
-  /** Runtime launch spec; required unless harnessFactory is supplied. */
+  /** Runtime launch spec; required unless runtimeFactory is supplied. */
   launch?: LaunchSpec
   /** Optional extra HarnessClientOptions (timeouts, env override). */
   clientOptions?: Partial<HarnessClientOptions>
-  /** Optional explicit DeepSeekHarnessOptions factory (overrides launch). */
-  harnessOptions?: (opts: DeepSeekHarnessOptions) => DeepSeekHarnessOptions
   /**
-   * Optional factory for the DeepSeekHarness instance. Defaults to spawning
-   * one via the real SDK + LaunchSpec. Tests inject a fake. Production
+   * Optional factory for a fully-built BridgeRuntime. The default factory
+   * spawns one HarnessClient from the LaunchSpec and reports the real
+   * InitializeResult.serverInfo. Tests inject a fake here. Production
    * per-AgentRun ownership (4v1.11) will pass a per-call factory here.
    */
-  harnessFactory?: (opts: DeepSeekHarnessOptions) => DeepSeekHarness
+  runtimeFactory?: (req: CreateSessionRequest) => BridgeRuntime | Promise<BridgeRuntime>
+  /** Optional error sink (used by the SSE pump). Defaults to stderr. */
+  onError?: (err: unknown) => void
 }
 
 /** Per-session state stored on the bridge. */
@@ -65,13 +93,7 @@ interface SessionState {
   cwd: string
   provider: string
   model: string
-  harness: HarnessSessionHandle
-}
-
-/** Thin wrapper around DeepSeekHarness + an attached session id. */
-class HarnessSessionHandle {
-  readonly harness: DeepSeekHarness
-  constructor(harness: DeepSeekHarness) { this.harness = harness }
+  runtime: BridgeRuntime
 }
 
 /** A live SSE subscriber. */
@@ -85,8 +107,8 @@ interface Subscriber {
 export class Bridge {
   private readonly opts: BridgeOptions
   private readonly host: string
-  private harness: DeepSeekHarness | undefined
-  private starting: Promise<void> | undefined
+  private runtime: BridgeRuntime | undefined
+  private starting: Promise<BridgeRuntime> | undefined
   private closing = false
   private readonly sessions = new Map<string, SessionState>()
   private readonly subscribers = new Map<string, Subscriber>()
@@ -116,7 +138,7 @@ export class Bridge {
    * spawns the dsh-jsonrpc-agent itself. The bridge never spawns
    * directly, so exactly one process is started per runtime.
    */
-  private resolveLaunchOpts(): HarnessClientOptions {
+  private resolveLaunchOpts(req: CreateSessionRequest): HarnessClientOptions {
     if (!this.opts.launch) throw new Error('bridge launch spec missing')
     const resolved = resolveLaunch(this.opts.launch)
     return {
@@ -125,6 +147,47 @@ export class Bridge {
       ...(resolved.cwd ? { cwd: resolved.cwd } : {}),
       ...(resolved.env ? { env: resolved.env } : {}),
       ...(this.opts.clientOptions ?? {}),
+    }
+  }
+
+  /**
+   * Default runtime factory: spawn a HarnessClient and capture the
+   * real serverInfo from the `initialize` handshake. The harness/client
+   * is NOT created from a cordis cwd — the bridge just owns the process
+   * and the runtime creates sessions on its first prompt.
+   */
+  private async defaultRuntimeFactory(req: CreateSessionRequest): Promise<BridgeRuntime> {
+    const launchOpts = this.opts.launch
+      ? this.resolveLaunchOpts(req)
+      : {
+        // Test-only path: caller supplied runtimeFactory but no LaunchSpec.
+        command: '', args: [], cwd: req.cwd,
+      } as HarnessClientOptions
+    const client = new HarnessClient(launchOpts)
+    let serverInfo: { name: string; version: string } = UNKNOWN_SERVER_INFO
+    try {
+      client.start()
+      const init: InitializeResult = await client.initialize({
+        cwd: resolvePath(req.cwd),
+        provider: req.provider,
+        model: req.model,
+        ...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {}),
+      })
+      serverInfo = {
+        name: init.serverInfo.name,
+        version: init.serverInfo.version,
+      }
+    } catch (err) {
+      // Tear down the (failed) client before propagating so we never
+      // leak a child process.
+      try { await client.close() } catch {}
+      throw err
+    }
+    return {
+      client,
+      serverInfo,
+      start: async () => { /* already started above */ },
+      close: () => client.close(),
     }
   }
 
@@ -139,47 +202,33 @@ export class Bridge {
     if (this.server) {
       await new Promise<void>((resolve) => this.server!.close(() => resolve()))
     }
-    if (this.harness) {
-      await this.harness.close().catch(() => {})
-      this.harness = undefined
+    if (this.runtime) {
+      await this.runtime.close().catch(() => {})
+      this.runtime = undefined
     }
     this.sessions.clear()
   }
 
   /** Lazy runtime start with initialize handshake. */
-  private async ensureHarness(req: CreateSessionRequest): Promise<DeepSeekHarness> {
-    if (this.harness) return this.harness
-    if (this.starting) { await this.starting; return this.harness! }
+  private async ensureRuntime(req: CreateSessionRequest): Promise<BridgeRuntime> {
+    if (this.runtime) return this.runtime
+    if (this.starting) return this.starting
 
     const start = (async () => {
-      const launchOpts = this.opts.launch ? this.resolveLaunchOpts() : {
-        // Test-only path: caller supplied harnessFactory but no LaunchSpec.
-        command: '', args: [], cwd: req.cwd,
-      } as HarnessClientOptions
-      const harnessOpts: DeepSeekHarnessOptions = {
-        launch: launchOpts,
-        cwd: resolvePath(req.cwd),
-        provider: req.provider,
-        model: req.model,
-        ...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {}),
-      }
-      const finalOpts = this.opts.harnessOptions
-        ? this.opts.harnessOptions(harnessOpts)
-        : harnessOpts
-      const harness = this.opts.harnessFactory
-        ? this.opts.harnessFactory(finalOpts)
-        : new DeepSeekHarness(finalOpts)
-      await harness.start() // initialize handshake (no-op for test fakes)
-      this.harness = harness
+      const factory = this.opts.runtimeFactory ?? ((r) => this.defaultRuntimeFactory(r))
+      const runtime = await factory(req)
+      await runtime.start() // no-op for default factory (already initialized)
+      return runtime
     })()
 
     this.starting = start
     try {
-      await start
+      const runtime = await start
+      this.runtime = runtime
+      return runtime
     } finally {
       this.starting = undefined
     }
-    return this.harness!
   }
 
   /** HTTP router. */
@@ -217,14 +266,9 @@ export class Bridge {
     let message: string | undefined
     if (this.closing) {
       status = 'closed'
-    } else if (this.harness) {
+    } else if (this.runtime) {
       status = 'ready'
-      const server = this.harness.client as HarnessClient
-      // serverInfo is set after initialize; the SDK doesn't expose it post-hoc,
-      // so we cache the wire-stable name on first handshake. Until we have
-      // it cached we still report 'ready' once the harness exists.
-      serverInfo = (server as unknown as { _serverInfo?: { name: string; version: string } })._serverInfo
-        ?? { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' }
+      serverInfo = this.runtime.serverInfo
     } else if (this.starting) {
       status = 'starting'
     }
@@ -236,19 +280,18 @@ export class Bridge {
     if (!body?.cwd || !body.provider || !body.model) {
       sendJson(res, 400, { error: 'missing fields: cwd, provider, model' }); return
     }
-    const harness = await this.ensureHarness(body)
+    const runtime = await this.ensureRuntime(body)
     const sessionId = `s-${randomUUID().replaceAll('-', '').slice(0, 16)}`
-    const handle = new HarnessSessionHandle(harness)
     this.sessions.set(sessionId, {
       id: sessionId,
       cwd: resolvePath(body.cwd),
       provider: body.provider,
       model: body.model,
-      harness: handle,
+      runtime,
     })
     const response: CreateSessionResponse = {
       sessionId,
-      serverInfo: { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' },
+      serverInfo: runtime.serverInfo,
     }
     sendJson(res, 200, response)
   }
@@ -262,7 +305,7 @@ export class Bridge {
     try {
       // client.prompt returns the durable enqueue receipt { messageId: ... };
       // unwrap so the wire carries just the messageId string.
-      const receipt = await session.harness.harness.client.prompt(sessionId, body.contentBlocks as ContentBlock[])
+      const receipt = await session.runtime.client.prompt(sessionId, body.contentBlocks as ContentBlock[])
       sendJson(res, 200, { messageId: receipt } satisfies PromptResponse)
     } catch (err) {
       sendJson(res, 502, { error: 'upstream_prompt_failed', detail: String(err) })
@@ -288,7 +331,7 @@ export class Bridge {
       'cache-control': 'no-cache',
       'connection': 'keep-alive',
     })
-    const subscription = session.harness.harness.client.subscribeSessionTree(sessionId)
+    const subscription = session.runtime.client.subscribeSessionTree(sessionId)
     const sub: Subscriber = { id: subId, sessionId, res }
     this.subscribers.set(subId, sub)
 
@@ -314,8 +357,8 @@ export class Bridge {
         if (this.subscribers.has(subId)) {
           this.subscribers.delete(subId)
         }
-        // Best-effort log; in production this goes to stderr logger.
-        try { (this.opts as { onError?: (e: unknown) => void }).onError?.(err) } catch {}
+        // Best-effort log; in production this goes to the configured onError.
+        try { this.opts.onError?.(err) } catch {}
       } finally {
         subscription.close()
         this.subscribers.delete(subId)
