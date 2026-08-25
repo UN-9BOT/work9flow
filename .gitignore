@@ -23,3 +23,7 @@
 .work9flow.yaml
 .smoke-full-state/
 .smoke-full.log
+
+# Personal review-loop automation (see ~/.config/work9flow/skills/)
+.agents/skills/work9flow-review-loop/
+
