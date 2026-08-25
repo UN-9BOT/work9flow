@@ -33,9 +33,11 @@ func defaultAdvanceScript() map[string][]dsh.RawEvent {
 		}
 	}
 	return map[string][]dsh.RawEvent{
-		"sess-scout":      makeEv("scout", "scout done"),
-		"sess-planner":    makeEv("planner", "planner done"),
-		"sess-gatekeeper": makeEv("gatekeeper", "gatekeeper done"),
+		"sess-scout":       makeEv("scout", "scout done"),
+		"sess-planner":     makeEv("planner", "planner done"),
+		"sess-gatekeeper":  makeEv("gatekeeper", "gatekeeper done"),
+		"sess-implementer": makeEv("implementer", "implementer done"),
+		"sess-reviewer":    makeEv("reviewer", "reviewer done"),
 	}
 }
 
@@ -582,5 +584,163 @@ func TestFeaturedevGatekeeperFailedMarksRunFailed(t *testing.T) {
 	}
 	if got.TerminalReason == "" {
 		t.Errorf("TerminalReason empty")
+	}
+}
+
+// ---------- MVP 06: implementation + review ----------
+
+func TestFeaturedevImplementerRunsAndAdvancesToReview(t *testing.T) {
+	eng, repo, _, stop := newAgentEngine(t, map[string][]dsh.RawEvent{
+		"sess-scout":       {{SessionID: "sess-scout", Kind: "agent.completed", At: time.Unix(1, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance"}`)}},
+		"sess-planner":     {{SessionID: "sess-planner", Kind: "agent.completed", At: time.Unix(2, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`)}},
+		"sess-gatekeeper":  {{SessionID: "sess-gatekeeper", Kind: "agent.completed", At: time.Unix(3, 0).UTC(), Data: json.RawMessage(`{"outcome":"approve"}`)}},
+		"sess-implementer": {{SessionID: "sess-implementer", Kind: "agent.completed", At: time.Unix(4, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"other","name":"diff-summary.md","stage":"implementing","content":"changed a/b/c"}]}`)}},
+	})
+	defer stop()
+	run := mustCreateRun(t, eng, "feature-development", "x")
+	for i := 0; i < 5; i++ {
+		if err := eng.Step(context.Background(), run.ID); err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+	}
+	got, _ := repo.GetRun(context.Background(), run.ID)
+	if got.State != domain.RunImplementationReview {
+		t.Errorf("state = %q, want IMPLEMENTATION_REVIEW", got.State)
+	}
+	arts, _ := repo.ListArtifacts(context.Background(), run.ID)
+	for _, a := range arts {
+		if a.Name == "diff-summary.md" && a.Version != 1 {
+			t.Errorf("diff-summary version = %d, want 1", a.Version)
+		}
+	}
+}
+
+func TestFeaturedevReviewerApproveReachesDone(t *testing.T) {
+	eng, repo, _, stop := newAgentEngine(t, map[string][]dsh.RawEvent{
+		"sess-scout":       {{SessionID: "sess-scout", Kind: "agent.completed", At: time.Unix(1, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance"}`)}},
+		"sess-planner":     {{SessionID: "sess-planner", Kind: "agent.completed", At: time.Unix(2, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`)}},
+		"sess-gatekeeper":  {{SessionID: "sess-gatekeeper", Kind: "agent.completed", At: time.Unix(3, 0).UTC(), Data: json.RawMessage(`{"outcome":"approve"}`)}},
+		"sess-implementer": {{SessionID: "sess-implementer", Kind: "agent.completed", At: time.Unix(4, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance"}`)}},
+		"sess-reviewer":    {{SessionID: "sess-reviewer", Kind: "agent.completed", At: time.Unix(5, 0).UTC(), Data: json.RawMessage(`{"outcome":"approve","summary":"clean"}`)}},
+	})
+	defer stop()
+	run := mustCreateRun(t, eng, "feature-development", "ship it")
+	for i := 0; i < 6; i++ {
+		if err := eng.Step(context.Background(), run.ID); err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+	}
+	got, _ := repo.GetRun(context.Background(), run.ID)
+	if got.State != domain.RunDone {
+		t.Errorf("state = %q, want DONE", got.State)
+	}
+}
+
+func TestFeaturedevReviewerReviseLoopsBackToImplementing(t *testing.T) {
+	// Reviewer emits one IMPLEMENTATION_BUG finding and outcome=revise.
+	// The engine must route the run back to IMPLEMENTING.
+	eng, repo, _, stop := newAgentEngine(t, map[string][]dsh.RawEvent{
+		"sess-scout":       {{SessionID: "sess-scout", Kind: "agent.completed", At: time.Unix(1, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance"}`)}},
+		"sess-planner":     {{SessionID: "sess-planner", Kind: "agent.completed", At: time.Unix(2, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`)}},
+		"sess-gatekeeper":  {{SessionID: "sess-gatekeeper", Kind: "agent.completed", At: time.Unix(3, 0).UTC(), Data: json.RawMessage(`{"outcome":"approve"}`)}},
+		"sess-implementer": {{SessionID: "sess-implementer", Kind: "agent.completed", At: time.Unix(4, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance"}`)}},
+		"sess-reviewer": {{
+			SessionID: "sess-reviewer",
+			Kind:      "agent.completed",
+			At:        time.Unix(5, 0).UTC(),
+			Data: json.RawMessage(`{
+				"outcome":"revise",
+				"review_findings":[
+					{"class":"IMPLEMENTATION_BUG","statement":"missing error check"}
+				]
+			}`),
+		}},
+	})
+	defer stop()
+	run := mustCreateRun(t, eng, "feature-development", "x")
+	for i := 0; i < 6; i++ {
+		if err := eng.Step(context.Background(), run.ID); err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+	}
+	got, _ := repo.GetRun(context.Background(), run.ID)
+	if got.State != domain.RunImplementing {
+		t.Errorf("state = %q, want IMPLEMENTING (loop back)", got.State)
+	}
+	findings, _ := repo.BlockingFindings(context.Background(), run.ID)
+	if len(findings) != 1 {
+		t.Fatalf("blocking findings = %d, want 1", len(findings))
+	}
+	if findings[0].Class != domain.FindingImplementationBug {
+		t.Errorf("class = %q, want IMPLEMENTATION_BUG", findings[0].Class)
+	}
+}
+
+func TestFeaturedevReviewerRevisePlanRoutesBackToPlanReview(t *testing.T) {
+	eng, repo, _, stop := newAgentEngine(t, map[string][]dsh.RawEvent{
+		"sess-scout":       {{SessionID: "sess-scout", Kind: "agent.completed", At: time.Unix(1, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance"}`)}},
+		"sess-planner":     {{SessionID: "sess-planner", Kind: "agent.completed", At: time.Unix(2, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`)}},
+		"sess-gatekeeper":  {{SessionID: "sess-gatekeeper", Kind: "agent.completed", At: time.Unix(3, 0).UTC(), Data: json.RawMessage(`{"outcome":"approve"}`)}},
+		"sess-implementer": {{SessionID: "sess-implementer", Kind: "agent.completed", At: time.Unix(4, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance"}`)}},
+		"sess-reviewer": {{
+			SessionID: "sess-reviewer",
+			Kind:      "agent.completed",
+			At:        time.Unix(5, 0).UTC(),
+			Data: json.RawMessage(`{
+				"outcome":"revise_plan",
+				"review_findings":[
+					{"class":"PLAN_DEFECT","statement":"step 2 is unbuildable"}
+				]
+			}`),
+		}},
+	})
+	defer stop()
+	run := mustCreateRun(t, eng, "feature-development", "x")
+	for i := 0; i < 6; i++ {
+		if err := eng.Step(context.Background(), run.ID); err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+	}
+	got, _ := repo.GetRun(context.Background(), run.ID)
+	if got.State != domain.RunPlanReview {
+		t.Errorf("state = %q, want PLAN_REVIEW", got.State)
+	}
+}
+
+func TestFeaturedevReviewerWaitUserCreatesAttention(t *testing.T) {
+	eng, repo, _, stop := newAgentEngine(t, map[string][]dsh.RawEvent{
+		"sess-scout":       {{SessionID: "sess-scout", Kind: "agent.completed", At: time.Unix(1, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance"}`)}},
+		"sess-planner":     {{SessionID: "sess-planner", Kind: "agent.completed", At: time.Unix(2, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`)}},
+		"sess-gatekeeper":  {{SessionID: "sess-gatekeeper", Kind: "agent.completed", At: time.Unix(3, 0).UTC(), Data: json.RawMessage(`{"outcome":"approve"}`)}},
+		"sess-implementer": {{SessionID: "sess-implementer", Kind: "agent.completed", At: time.Unix(4, 0).UTC(), Data: json.RawMessage(`{"outcome":"advance"}`)}},
+		"sess-reviewer": {{
+			SessionID: "sess-reviewer",
+			Kind:      "agent.completed",
+			At:        time.Unix(5, 0).UTC(),
+			Data: json.RawMessage(`{
+				"outcome":"wait_user",
+				"review_findings":[
+					{"class":"REQUIREMENT_AMBIGUITY","statement":"what status codes for invalid input?"}
+				]
+			}`),
+		}},
+	})
+	defer stop()
+	run := mustCreateRun(t, eng, "feature-development", "x")
+	for i := 0; i < 6; i++ {
+		if err := eng.Step(context.Background(), run.ID); err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+	}
+	got, _ := repo.GetRun(context.Background(), run.ID)
+	if got.State != domain.RunWaitingForUser {
+		t.Errorf("state = %q, want WAITING_FOR_USER", got.State)
+	}
+	atts, _ := repo.ListAttention(context.Background(), run.ID)
+	if len(atts) != 1 {
+		t.Fatalf("attentions = %d, want 1", len(atts))
+	}
+	if atts[0].Title == "" {
+		t.Errorf("attention title empty")
 	}
 }

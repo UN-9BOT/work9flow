@@ -34,6 +34,18 @@ type ArtifactPayload struct {
 	Metadata   map[string]string   `json:"metadata,omitempty"`
 }
 
+// FindingPayload is one of the optional entries under the "findings"
+// array of an agent.completed event. Reviewers emit one entry per
+// observation; Runner.persistFindings routes each into storage.
+type FindingPayload struct {
+	Class     domain.FindingClass `json:"class"`
+	Statement string              `json:"statement"`
+	Evidence  string              `json:"evidence,omitempty"`
+	Reference string              `json:"reference,omitempty"`
+	Rationale string              `json:"rationale,omitempty"`
+	Action    string              `json:"action,omitempty"`
+}
+
 // Outcome is the high-level verdict of one agent run.
 type Outcome struct {
 	// Kind is the canonical agent verdict. Recognised values:
@@ -55,6 +67,10 @@ type Outcome struct {
 	// and persisted via storage.AddArtifact. The engine can ignore this
 	// field; it exists so the agent contract is self-describing.
 	Artifacts []ArtifactPayload
+	// ReviewFindings are extracted from the agent.completed "findings" array
+	// and persisted via storage.AddFinding. Reviewers emit one entry
+	// per observation; the engine routes on Class.
+	ReviewFindings []FindingPayload
 }
 
 // ErrSessionIncomplete is returned when DSH never emits agent.completed
@@ -124,6 +140,9 @@ func (r *Runner) Run(ctx context.Context, run domain.WorkflowRun, role, model st
 	}
 	out := reduceOutcome(final.Data)
 	if err := r.persistArtifacts(ctx, run.ID, role, out.Artifacts); err != nil {
+		return Outcome{}, err
+	}
+	if err := r.persistFindings(ctx, run.ID, role, out.ReviewFindings); err != nil {
 		return Outcome{}, err
 	}
 	if out.Summary != "" {
@@ -219,13 +238,14 @@ func reduceOutcome(data json.RawMessage) Outcome {
 		Questions []string          `json:"questions"`
 		Summary   string            `json:"summary"`
 		Artifacts []ArtifactPayload `json:"artifacts"`
+		ReviewFindings []FindingPayload `json:"review_findings"`
 	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return Outcome{Kind: "advance", Summary: string(data)}
 	}
 	kind := probe.Outcome
 	switch kind {
-	case "approve", "revise", "wait_user", "done", "failed", "advance":
+	case "approve", "revise", "revise_plan", "wait_user", "done", "failed", "advance", "blocked_by_plan":
 	default:
 		kind = "advance"
 	}
@@ -234,11 +254,12 @@ func reduceOutcome(data json.RawMessage) Outcome {
 		artifacts = probe.Artifacts
 	}
 	return Outcome{
-		Kind:      kind,
-		Findings:  probe.Findings,
-		Questions: probe.Questions,
-		Summary:   probe.Summary,
-		Artifacts: artifacts,
+		Kind:           kind,
+		Findings:       probe.Findings,
+		Questions:      probe.Questions,
+		Summary:        probe.Summary,
+		Artifacts:      artifacts,
+		ReviewFindings: probe.ReviewFindings,
 	}
 }
 
@@ -246,6 +267,33 @@ func reduceOutcome(data json.RawMessage) Outcome {
 // storage.AddArtifact so the durable record reflects the agent's output.
 // A blank ContentRef defaults to the content (inline form); ContentRef
 // wins when both are present so callers can store off-runway blobs.
+func (r *Runner) persistFindings(ctx context.Context, runID, role string, items []FindingPayload) error {
+	for _, item := range items {
+		if item.Statement == "" {
+			continue
+		}
+		if item.Class == "" {
+			item.Class = domain.FindingImplementationBug
+		}
+		f := domain.Finding{
+			RunID:      runID,
+			ReviewerID: role,
+			Class:      item.Class,
+			Blocking:   item.Class.IsBlocking(),
+			Statement:  item.Statement,
+			Evidence:   item.Evidence,
+			Reference:  item.Reference,
+			Rationale:  item.Rationale,
+			Action:     item.Action,
+			CreatedAt:  r.now(),
+		}
+		if err := r.Repo.AddFinding(ctx, f); err != nil {
+			return fmt.Errorf("agents: persist finding %s: %w", item.Class, err)
+		}
+	}
+	return nil
+}
+
 func (r *Runner) persistArtifacts(ctx context.Context, runID, role string, items []ArtifactPayload) error {
 	for _, item := range items {
 		if item.Name == "" {

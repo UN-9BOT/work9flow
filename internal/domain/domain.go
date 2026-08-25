@@ -242,6 +242,50 @@ func (r *RunArtifacts) Active(k ArtifactKind, name string) *Artifact {
 	return &cp
 }
 
+// FindingClass categorises a review finding emitted by Agent 5
+// (Implementation Review Orchestrator). The class drives the
+// controller's deterministic routing policy.
+type FindingClass string
+
+const (
+	FindingImplementationBug FindingClass = "IMPLEMENTATION_BUG"
+	FindingPlanDefect        FindingClass = "PLAN_DEFECT"
+	FindingRequirementAmbig  FindingClass = "REQUIREMENT_AMBIGUITY"
+	FindingOutOfScope        FindingClass = "OUT_OF_SCOPE"
+	FindingStyle             FindingClass = "STYLE"
+	FindingFalsePositive     FindingClass = "FALSE_POSITIVE"
+)
+
+// IsBlocking reports whether the controller must keep the run open
+// until the finding is resolved. STYLE and FALSE_POSITIVE are
+// informational only; the rest are blocking by default.
+func (c FindingClass) IsBlocking() bool {
+	switch c {
+	case FindingImplementationBug, FindingPlanDefect,
+		FindingRequirementAmbig, FindingOutOfScope:
+		return true
+	}
+	return false
+}
+
+// Finding is one reviewer's observation about an implementation.
+// Findings are append-only; storage retains every version for audit.
+type Finding struct {
+	ID         string          `json:"id"`
+	RunID      string          `json:"run_id"`
+	ReviewerID string          `json:"reviewer_id"`
+	Class      FindingClass    `json:"class"`
+	Blocking   bool            `json:"blocking"`
+	Statement  string          `json:"statement"`
+	Evidence   string          `json:"evidence,omitempty"`
+	Reference  string          `json:"reference,omitempty"`
+	Rationale  string          `json:"rationale,omitempty"`
+	Action     string          `json:"action,omitempty"`
+	CreatedAt  time.Time       `json:"created_at"`
+	Resolved   bool            `json:"resolved,omitempty"`
+	ResolvedAt time.Time       `json:"resolved_at,omitempty"`
+}
+
 // Clarification is an append-only entry in a run's clarification log.
 type Clarification struct {
 	Seq      int64     `json:"seq"`
