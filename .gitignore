@@ -15,3 +15,11 @@
 
 # Local smoke test state
 .work9flow-smoke/
+
+# Local build outputs and smoke test scratch files
+/bin/
+.fake_provider.py
+.providers.toml
+.work9flow.yaml
+.smoke-full-state/
+.smoke-full.log
