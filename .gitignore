@@ -4,3 +4,9 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Go build artifacts
+/cmd/*/work9flowd
+/cmd/*/work9flow
+*.test
+*.out
