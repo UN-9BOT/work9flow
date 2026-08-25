@@ -72,7 +72,10 @@ type sqliteRepo struct {
 // which makes tests lie about cross-connection visibility).
 func OpenSQLite(path string) (Repo, error) {
 	if path == ":memory:" {
-		path = "file::memory:?cache=shared"
+		// Unique shared-cache DB per OpenSQLite call so two callers
+		// in the same process do not share the same database (which
+		// would otherwise cause one to silently overwrite another).
+		path = "file::memory:?cache=shared&name=" + randSuffix()
 	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
