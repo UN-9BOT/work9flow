@@ -21,9 +21,7 @@ test('resolveLaunch: defaults to exe mode when no env/mode set', () => {
   try {
     const fakeExe = join(dir, 'fake-exe')
     writeFileSync(fakeExe, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
-    delete process.env.DSH_RUNTIME_MODE
     delete process.env.DSH_RUNTIME_EXE
-    delete process.env.DSH_NODE_BIN_JS
     const res = resolveLaunch({ cordisConfig: cordis, exePath: fakeExe })
     assert.equal(res.mode, 'exe')
     assert.equal(res.command, fakeExe)
@@ -31,18 +29,25 @@ test('resolveLaunch: defaults to exe mode when no env/mode set', () => {
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
-test('resolveLaunch: DSH_RUNTIME_MODE=node forces node mode and reports missing bin', () => {
+test('resolveLaunch: explicit mode=node without nodeBinJs fails with explicit-message', () => {
   const { dir, cordis } = tmpFile()
   try {
-    const prev = process.env.DSH_RUNTIME_MODE
-    process.env.DSH_RUNTIME_MODE = 'node'
     delete process.env.DSH_NODE_BIN_JS
     assert.throws(
-      () => resolveLaunch({ cordisConfig: cordis }),
-      /DSH node-mode bin not found/,
+      () => resolveLaunch({ mode: 'node', cordisConfig: cordis }),
+      /DSH node-mode requires an explicit nodeBinJs path/,
     )
-    if (prev === undefined) delete process.env.DSH_RUNTIME_MODE
-    else process.env.DSH_RUNTIME_MODE = prev
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('resolveLaunch: exe mode without explicit exe fails with explicit-message', () => {
+  const { dir, cordis } = tmpFile()
+  try {
+    delete process.env.DSH_RUNTIME_EXE
+    assert.throws(
+      () => resolveLaunch({ cordisConfig: cordis }),
+      /DSH exe-mode requires an explicit DSH_RUNTIME_EXE/,
+    )
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 

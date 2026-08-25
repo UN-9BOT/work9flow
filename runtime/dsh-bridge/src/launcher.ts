@@ -1,23 +1,24 @@
 /**
- * Resolve and spawn the dsh-jsonrpc-agent runtime subprocess.
+ * Pure argv resolver for the dsh-jsonrpc-agent runtime. The upstream
+ * HarnessClient owns the actual subprocess lifecycle and spawns the
+ * binary itself; the bridge never spawns directly.
  *
- * Two carriers (per upstream python/sdk-runtime README):
+ * Two carriers are supported (per upstream python/sdk-runtime README):
  *
- *  - exe (production): a single-file `dsh-jsonrpc-agent-pkg-<platform>-<arch>`
- *    executable plus a matching ripgrep `-rg` sidecar. Shipped in the
- *    `deepseek-harness-runtime-bin` wheel; no Node required on the host.
+ *  - exe (production): a single-file `dsh-jsonrpc-agent-pkg-<os>-<arch>`
+ *    executable plus matching ripgrep `-rg` and platform spawn-helper
+ *    sidecars, shipped in the `deepseek-harness-runtime-bin` wheel.
+ *    No auto-discovery: the operator MUST set DSH_RUNTIME_EXE (or
+ *    pass LaunchSpec.exePath) to the absolute path of the runtime
+ *    binary. Real resolver that handles upstream carrier names +
+ *    sidecar binaries is tracked in bead 4i1.
  *
- *  - node (dev-only): the full deploy closure at
+ *  - node (dev-only): the full deploy closure
  *    `runtime/node/node_modules/@deepseek-ai/dsh-sdk-jsonrpc-demo/lib/packaged-bin.js`,
- *    executed as `node <bin.js> <cordis.yml>`. Never selected automatically
- *    in production; must be opted into explicitly via DSH_RUNTIME_MODE=node
- *    or `mode: 'node'` in LaunchSpec.
- *
- * This module is intentionally tiny: it does NOT inspect the runtime's
- * stdio (that is the SDK client's job). It only picks the argv tuple.
+ *    executed as `node <bin.js> <cordis.yml>`. Must be opted into
+ *    explicitly via DSH_NODE_BIN_JS or LaunchSpec.nodeBinJs.
  */
 import { existsSync } from 'node:fs'
-import { resolve } from 'node:path'
 
 export type LaunchMode = 'exe' | 'node'
 
@@ -58,12 +59,18 @@ export function resolveLaunch(spec: LaunchSpec): ResolvedLaunch {
     ?? (process.env.DSH_RUNTIME_MODE === 'node' ? 'node' : 'exe')
 
   if (mode === 'node') {
-    const binJs = spec.nodeBinJs
-      ?? process.env.DSH_NODE_BIN_JS
-      ?? resolve('runtime/node/node_modules/@deepseek-ai/dsh-sdk-jsonrpc-demo/lib/packaged-bin.js')
+    // No auto-discovery: dev-mode node carrier must be wired by the
+    // operator explicitly via DSH_NODE_BIN_JS (or LaunchSpec.nodeBinJs).
+    const binJs = spec.nodeBinJs ?? process.env.DSH_NODE_BIN_JS
+    if (!binJs) {
+      throw new Error(
+        `DSH node-mode requires an explicit nodeBinJs path: set ` +
+        `DSH_NODE_BIN_JS or pass LaunchSpec.nodeBinJs. Real resolver ` +
+        `is tracked in bead 4i1.`,
+      )
+    }
     if (!existsSync(binJs)) {
-      throw new Error(`DSH node-mode bin not found: ${binJs}. ` +
-        `Build it via deepseek-harness' scripts/build-exe-for-python-sdk.ts in dev mode.`)
+      throw new Error(`DSH node-mode bin not found: ${binJs}.`)
     }
     return {
       command: process.execPath,
@@ -74,14 +81,22 @@ export function resolveLaunch(spec: LaunchSpec): ResolvedLaunch {
     }
   }
 
-  // exe mode
-  const exe = spec.exePath
-    ?? process.env.DSH_RUNTIME_EXE
-    ?? `dsh-jsonrpc-agent-pkg-${process.platform}-${process.arch}`
+  // exe mode (production)
+  // No platform-arch guessing, no PATH lookup: the operator MUST set
+  // DSH_RUNTIME_EXE (or pass LaunchSpec.exePath) to the absolute path
+  // of the dsh-jsonrpc-agent binary from the upstream runtime wheel.
+  // Platform guessing mismatched upstream carrier names (Node reports
+  // darwin, upstream uses -macos-) and never located the -rg /
+  // platform spawn-helper sidecars the runtime wheel depends on.
+  const exe = spec.exePath ?? process.env.DSH_RUNTIME_EXE
+  if (!exe) {
+    throw new Error(
+      `DSH exe-mode requires an explicit DSH_RUNTIME_EXE (or ` +
+      `LaunchSpec.exePath). Real resolver is tracked in bead 4i1.`,
+    )
+  }
   if (!existsSync(exe)) {
-    throw new Error(`DSH runtime exe not found: ${exe}. ` +
-      `Install the deepseek-harness-runtime-bin wheel for ${process.platform}/${process.arch}, ` +
-      `or set DSH_RUNTIME_EXE/DshBridge.runtimeExe to the executable path.`)
+    throw new Error(`DSH runtime exe not found at: ${exe}.`)
   }
   return {
     command: exe,
