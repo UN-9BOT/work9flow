@@ -65,7 +65,15 @@ type sqliteRepo struct {
 
 // OpenSQLite opens a SQLite-backed Repo. path may be ":memory:" for
 // tests or a filesystem path under the runtime's state_dir.
+//
+// ":memory:" is normalised to a shared-cache URI so multiple
+// connections in the pool see the same database (otherwise each
+// sql.DB connection would get its own private in-memory database,
+// which makes tests lie about cross-connection visibility).
 func OpenSQLite(path string) (Repo, error) {
+	if path == ":memory:" {
+		path = "file::memory:?cache=shared"
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("storage: open %s: %w", path, err)
