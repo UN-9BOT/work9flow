@@ -50,9 +50,12 @@ export interface ResolvedLaunch {
 /**
  * Resolve the launch argv without spawning.
  *
- * Default exe name follows upstream: `dsh-jsonrpc-agent-pkg-<platform>-<arch>`.
- * The runtime wheel places it on PATH or in a venv bin dir; we look first
- * on PATH, then a conventional `./.dsh-runtime/` next to the bridge.
+ * The bridge is a pure resolver: it never searches PATH, never guesses
+ * `<platform>-<arch>`, and never inspects `./.dsh-runtime/`. The operator
+ * MUST set DSH_RUNTIME_EXE / LaunchSpec.exePath (or DSH_NODE_BIN_JS /
+ * LaunchSpec.nodeBinJs for the dev-only node mode) to the absolute path
+ * of the runtime binary. A real resolver that handles upstream carrier
+ * names and sidecar binaries is tracked in bead work9flow-4a2.
  */
 export function resolveLaunch(spec: LaunchSpec): ResolvedLaunch {
   const mode = spec.mode
