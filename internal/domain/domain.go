@@ -75,12 +75,15 @@ func CanTransition(from, to RunState) bool {
 
 // Workflow is a workflow definition. Runs reference it by ID/version.
 type Workflow struct {
-	ID         string            `json:"id"`
-	Name       string            `json:"name"`
-	Version    string            `json:"version"`
-	Stages     []Stage           `json:"stages"`
-	Limits     map[string]int    `json:"limits"`
-	AgentRoles []string          `json:"agent_roles"`
+	ID             string         `json:"id"`
+	Name           string         `json:"name"`
+	Version        string         `json:"version"`
+	InitialState   RunState       `json:"initial_state"`
+	InitialStage   string         `json:"initial_stage"`
+	TerminalStates []RunState     `json:"terminal_states"`
+	Stages         []Stage        `json:"stages"`
+	Limits         map[string]int `json:"limits"`
+	AgentRoles     []string       `json:"agent_roles"`
 }
 
 // Stage is one node of a workflow definition.
