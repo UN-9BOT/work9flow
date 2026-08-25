@@ -54,6 +54,11 @@ type Repo interface {
 	AppendClarification(ctx context.Context, runID string, c domain.Clarification) error
 	Clarifications(ctx context.Context, runID string) ([]domain.Clarification, error)
 
+	AddFinding(ctx context.Context, f domain.Finding) error
+	ListFindings(ctx context.Context, runID string) ([]domain.Finding, error)
+	BlockingFindings(ctx context.Context, runID string) ([]domain.Finding, error)
+	ResolveFindings(ctx context.Context, runID string) error
+
 	Close() error
 }
 
@@ -169,6 +174,22 @@ CREATE TABLE IF NOT EXISTS clarifications (
   PRIMARY KEY (run_id, seq)
 );
 
+CREATE TABLE IF NOT EXISTS findings (
+  id          TEXT PRIMARY KEY,
+  run_id      TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+  reviewer_id TEXT NOT NULL DEFAULT '',
+  class       TEXT NOT NULL,
+  blocking    INTEGER NOT NULL DEFAULT 0,
+  statement   TEXT NOT NULL,
+  evidence    TEXT NOT NULL DEFAULT '',
+  reference   TEXT NOT NULL DEFAULT '',
+  rationale   TEXT NOT NULL DEFAULT '',
+  action      TEXT NOT NULL DEFAULT '',
+  created_at  INTEGER NOT NULL,
+  resolved    INTEGER NOT NULL DEFAULT 0,
+  resolved_at INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS events_run_seq ON events(run_id, seq);
 CREATE INDEX IF NOT EXISTS artifacts_run ON artifacts(run_id);
 CREATE INDEX IF NOT EXISTS attentions_run ON attentions(run_id);
@@ -176,6 +197,90 @@ CREATE INDEX IF NOT EXISTS attentions_run ON attentions(run_id);
 
 func (r *sqliteRepo) migrate() error {
 	_, err := r.db.Exec(schema)
+	return err
+}
+
+
+// ---------- findings ----------
+
+func (r *sqliteRepo) AddFinding(ctx context.Context, f domain.Finding) error {
+	if _, err := r.GetRun(ctx, f.RunID); err != nil {
+		return err
+	}
+	if f.CreatedAt.IsZero() {
+		f.CreatedAt = time.Now().UTC()
+	}
+	if f.ID == "" {
+		f.ID = "find-" + f.RunID + "-" + randSuffix()
+	}
+	blocking := 0
+	if f.Blocking {
+		blocking = 1
+	}
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO findings(id, run_id, reviewer_id, class, blocking, statement,
+                     evidence, reference, rationale, action,
+                     created_at, resolved, resolved_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)`,
+		f.ID, f.RunID, f.ReviewerID, string(f.Class), blocking, f.Statement,
+		f.Evidence, f.Reference, f.Rationale, f.Action, f.CreatedAt.Unix())
+	return err
+}
+
+func (r *sqliteRepo) ListFindings(ctx context.Context, runID string) ([]domain.Finding, error) {
+	rows, err := r.db.QueryContext(ctx, `
+SELECT id, run_id, reviewer_id, class, blocking, statement, evidence,
+       reference, rationale, action, created_at, resolved, resolved_at
+FROM findings WHERE run_id = ? ORDER BY created_at ASC`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.Finding
+	for rows.Next() {
+		var (
+			f           domain.Finding
+			class       string
+			blocking    int
+			resolved    int
+			createdAt   int64
+			resolvedAt  int64
+		)
+		if err := rows.Scan(&f.ID, &f.RunID, &f.ReviewerID, &class, &blocking,
+			&f.Statement, &f.Evidence, &f.Reference, &f.Rationale, &f.Action,
+			&createdAt, &resolved, &resolvedAt); err != nil {
+			return nil, err
+		}
+		f.Class = domain.FindingClass(class)
+		f.Blocking = blocking != 0
+		f.Resolved = resolved != 0
+		f.CreatedAt = time.Unix(createdAt, 0).UTC()
+		if resolvedAt > 0 {
+			f.ResolvedAt = time.Unix(resolvedAt, 0).UTC()
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+func (r *sqliteRepo) BlockingFindings(ctx context.Context, runID string) ([]domain.Finding, error) {
+	all, err := r.ListFindings(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	var out []domain.Finding
+	for _, f := range all {
+		if f.Blocking && !f.Resolved {
+			out = append(out, f)
+		}
+	}
+	return out, nil
+}
+
+func (r *sqliteRepo) ResolveFindings(ctx context.Context, runID string) error {
+	_, err := r.db.ExecContext(ctx, `
+UPDATE findings SET resolved = 1, resolved_at = ?
+WHERE run_id = ? AND resolved = 0`, time.Now().UTC().Unix(), runID)
 	return err
 }
 

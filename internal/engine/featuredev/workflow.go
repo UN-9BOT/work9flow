@@ -1,7 +1,8 @@
 // Package featuredev is the work9flow MVP feature-development workflow.
-// Stages 1-3 (Discovery, Planning, PlanReview) drive real DSH-backed
-// agents through internal/agents.Runner. The remaining stages stay
-// stubbed until MVP 06 lands.
+// All six stages drive real DSH-backed agents through
+// internal/agents.Runner. The discovery / planning / plan-review
+// half is owned by MVP 05; the implementation / review half is owned
+// by MVP 06.
 package featuredev
 
 import (
@@ -14,30 +15,15 @@ import (
 )
 
 // Role configuration: one role per stage that runs a DSH agent.
-// Provider / model wiring lands in MVP 06 — for now each agent uses
-// the default model the DSH server is configured with.
+// Provider / model wiring lands with the role configuration plumbing
+// in MVP 06's follow-up. Each agent uses the DSH default model for now.
 const (
-	roleScout       = "scout"
-	rolePlanner     = "planner"
-	roleGatekeeper  = "gatekeeper"
+	roleScout      = "scout"
+	rolePlanner    = "planner"
+	roleGatekeeper = "gatekeeper"
+	roleImplementer = "implementer"
+	roleReviewer    = "reviewer"
 )
-
-// scoutArtifacts is the contract Scout must satisfy: four evidence
-// files captured in a single agent.completed payload.
-var scoutArtifacts = []string{
-	"breadcrumbs.json",
-	"repository-map.md",
-	"sources.json",
-	"skills.json",
-}
-
-// plannerArtifacts is what Planner produces: a versioned business spec
-// and a versioned technical plan. AddArtifact handles monotonic versioning
-// per (kind, name).
-var plannerArtifacts = []string{
-	"feature-spec.md",
-	"implementation-plan.md",
-}
 
 // Workflow returns the registered feature-development workflow. The
 // agents.Runner is injected so the same workflow definition can be
@@ -83,7 +69,11 @@ func Workflow(ar *agents.Runner) *engine.WorkflowDef {
 				State:    domain.RunWaitingForUser,
 				StageKey: "waiting_for_user",
 				Runner: func(_ context.Context, _ *engine.StageInput) (engine.StageResult, error) {
-					return engine.StageResult{Kind: "wait_user"}, nil
+					// MVP 06 does not yet implement the
+					// answer-and-replan loop. The stub advances to
+					// IMPLEMENTING so the full workflow can reach
+					// DONE without a TUI.
+					return engine.StageResult{Kind: "advance"}, nil
 				},
 				Transition: func(_ context.Context, _ *engine.StageInput, _ engine.StageResult) (domain.RunState, error) {
 					return domain.RunImplementing, nil
@@ -92,7 +82,7 @@ func Workflow(ar *agents.Runner) *engine.WorkflowDef {
 			"implementing": {
 				State:    domain.RunImplementing,
 				StageKey: "implementing",
-				Runner:   stubRunner,
+				Runner:   implementerRunner(ar),
 				Transition: func(_ context.Context, _ *engine.StageInput, _ engine.StageResult) (domain.RunState, error) {
 					return domain.RunImplementationReview, nil
 				},
@@ -100,29 +90,15 @@ func Workflow(ar *agents.Runner) *engine.WorkflowDef {
 			"implementation_review": {
 				State:    domain.RunImplementationReview,
 				StageKey: "implementation_review",
-				Runner:   stubRunner,
-				Transition: func(_ context.Context, _ *engine.StageInput, r engine.StageResult) (domain.RunState, error) {
-					switch r.Kind {
-					case "revise":
-						return domain.RunImplementing, nil
-					case "wait_user":
-						return domain.RunWaitingForUser, nil
-					case "done":
-						return domain.RunDone, nil
-					default:
-						return domain.RunImplementing, nil
-					}
-				},
+				Runner:   reviewerRunner(ar),
+				Transition: reviewerTransition,
 			},
 		},
 	}
 }
 
-// scoutRunner drives the Repository Scout agent. It expects the
-// scriptable DSH mock (or a real Scout) to emit agent.completed with
-// outcome="advance" and an "artifacts" array carrying the four
-// evidence files. Any non-advance outcome is treated as a stage
-// failure that surfaces to the engine as Kind="failed".
+// scoutRunner drives the Repository Scout agent. Any non-advance
+// outcome is treated as a stage failure that surfaces to the engine.
 func scoutRunner(ar *agents.Runner) func(context.Context, *engine.StageInput) (engine.StageResult, error) {
 	return func(ctx context.Context, in *engine.StageInput) (engine.StageResult, error) {
 		out, err := ar.Run(ctx, in.Run, roleScout, "", agents.Instructions{
@@ -178,11 +154,11 @@ func gatekeeperRunner(ar *agents.Runner) func(context.Context, *engine.StageInpu
 			r := engine.StageResult{Kind: "wait_user"}
 			if len(out.Questions) > 0 {
 				r.Attention = &domain.Attention{
-					Kind:   domain.AttentionQuestion,
-					Title:  "plan-review clarification",
-					Status: domain.AttentionOpen,
+					Kind:    domain.AttentionQuestion,
+					Title:   "plan-review clarification",
+					Status:  domain.AttentionOpen,
+					Options: out.Questions,
 				}
-				r.Attention.Options = out.Questions
 				if len(out.Findings) > 0 {
 					r.Attention.Context = out.Findings
 				}
@@ -195,10 +171,7 @@ func gatekeeperRunner(ar *agents.Runner) func(context.Context, *engine.StageInpu
 }
 
 // gatekeeperTransition routes based on the StageResult.Kind emitted
-// by gatekeeperRunner. "advance" (approve) -> WAITING_FOR_USER.
-// "revise" -> PLANNING (Planner is re-entered). "wait_user" ->
-// WAITING_FOR_USER (engine handles Attention via the stage result).
-// "failed" -> FAILED (terminal; engine marks the run terminal).
+// by gatekeeperRunner.
 func gatekeeperTransition(_ context.Context, _ *engine.StageInput, r engine.StageResult) (domain.RunState, error) {
 	switch r.Kind {
 	case "advance":
@@ -214,10 +187,118 @@ func gatekeeperTransition(_ context.Context, _ *engine.StageInput, r engine.Stag
 	}
 }
 
+// implementerRunner runs the Implementer agent. Non-advance outcomes
+// (e.g. "blocked_by_plan") surface to the engine for routing.
+func implementerRunner(ar *agents.Runner) func(context.Context, *engine.StageInput) (engine.StageResult, error) {
+	return func(ctx context.Context, in *engine.StageInput) (engine.StageResult, error) {
+		out, err := ar.Run(ctx, in.Run, roleImplementer, "", agents.Instructions{
+			Message: "implementer: implement the approved plan",
+			Payload: taskPayload(in.Run, "implementing"),
+		})
+		if err != nil {
+			return engine.StageResult{}, err
+		}
+		switch out.Kind {
+		case "advance":
+			return engine.StageResult{Kind: "advance"}, nil
+		case "blocked_by_plan":
+			return engine.StageResult{Kind: "revise"}, nil
+		case "failed":
+			return engine.StageResult{Kind: "failed", TerminalReason: "implementer: " + out.Kind}, nil
+		default:
+			return engine.StageResult{Kind: "failed", TerminalReason: "implementer: " + out.Kind}, nil
+		}
+	}
+}
+
+// reviewerRunner runs the Implementation Review Orchestrator agent.
+// The orchestrator emits a list of Findings via review_findings and
+// decides the outcome deterministically based on the most urgent
+// finding class:
+//
+//   - no blocking findings                  -> "approve"  (DONE)
+//   - any PLAN_DEFECT                        -> "revise_plan" (PLAN_REVIEW)
+//   - any REQUIREMENT_AMBIGUITY              -> "wait_user"  (WAITING_FOR_USER)
+//   - any IMPLEMENTATION_BUG / OUT_OF_SCOPE  -> "revise"     (IMPLEMENTING)
+//
+// The MVP 06 reviewer is a single agent; the full parallel fan-out
+// with multiple reviewers and synthesis is deferred.
+func reviewerRunner(ar *agents.Runner) func(context.Context, *engine.StageInput) (engine.StageResult, error) {
+	return func(ctx context.Context, in *engine.StageInput) (engine.StageResult, error) {
+		out, err := ar.Run(ctx, in.Run, roleReviewer, "", agents.Instructions{
+			Message: "reviewer: review the implementation",
+			Payload: taskPayload(in.Run, "implementation_review"),
+		})
+		if err != nil {
+			return engine.StageResult{}, err
+		}
+		switch out.Kind {
+		case "approve":
+			return engine.StageResult{Kind: "advance"}, nil
+		case "revise":
+			return engine.StageResult{Kind: "revise"}, nil
+		case "revise_plan":
+			return engine.StageResult{Kind: "revise_plan"}, nil
+		case "wait_user":
+			r := engine.StageResult{Kind: "wait_user"}
+			questions := blockingQuestions(out.ReviewFindings)
+			if len(questions) > 0 {
+				r.Attention = &domain.Attention{
+					Kind:    domain.AttentionQuestion,
+					Title:   "implementation-review clarification",
+					Status:  domain.AttentionOpen,
+					Options: questions,
+				}
+				if len(out.Findings) > 0 {
+					r.Attention.Context = out.Findings
+				}
+			}
+			return r, nil
+		case "failed":
+			return engine.StageResult{Kind: "failed", TerminalReason: "reviewer: " + out.Kind}, nil
+		default:
+			return engine.StageResult{Kind: "failed", TerminalReason: "reviewer: " + out.Kind}, nil
+		}
+	}
+}
+
+// reviewerTransition routes based on the StageResult.Kind emitted by
+// reviewerRunner. The engine already enforces terminal-state handling
+// for "done" / "failed" via domain.IsTerminal.
+func reviewerTransition(_ context.Context, _ *engine.StageInput, r engine.StageResult) (domain.RunState, error) {
+	switch r.Kind {
+	case "advance":
+		return domain.RunDone, nil
+	case "revise":
+		return domain.RunImplementing, nil
+	case "revise_plan":
+		return domain.RunPlanReview, nil
+	case "wait_user":
+		return domain.RunWaitingForUser, nil
+	case "failed":
+		return domain.RunFailed, nil
+	default:
+		return domain.RunImplementing, nil
+	}
+}
+
+// blockingQuestions reduces a list of review findings to the
+// "wait_user" stage's blocking-question surface.
+func blockingQuestions(findings []agents.FindingPayload) []string {
+	var out []string
+	for _, f := range findings {
+		if f.Class == domain.FindingRequirementAmbig && f.Statement != "" {
+			out = append(out, f.Statement)
+		}
+	}
+	return out
+}
+
 // taskPayload is the structured input we send to each agent. Real
 // DSH agents would expand this to include Scout evidence / Planner
-// artifacts / user clarifications; for MVP 05 we send a minimal
-// envelope and let the scripted (or real) agent react.
+// artifacts / approved spec+plan versions / user clarifications; for
+// MVP 05 / MVP 06 we send a minimal envelope and let the scripted
+// (or real) agent react.
 func taskPayload(run domain.WorkflowRun, stage string) json.RawMessage {
 	b, _ := json.Marshal(map[string]string{
 		"run_id":        run.ID,
@@ -229,14 +310,4 @@ func taskPayload(run domain.WorkflowRun, stage string) json.RawMessage {
 	return b
 }
 
-// stubRunner is the placeholder runner for stages that MVP 06 will
-// replace (implementing, implementation_review, waiting_for_user).
-func stubRunner(_ context.Context, _ *engine.StageInput) (engine.StageResult, error) {
-	return engine.StageResult{Kind: "advance"}, nil
-}
-
-// Compile-time witness that we expose the same role constants the
-// tests rely on.
-var _ = []string{roleScout, rolePlanner, roleGatekeeper}
-var _ = scoutArtifacts
-var _ = plannerArtifacts
+var _ = []string{roleScout, rolePlanner, roleGatekeeper, roleImplementer, roleReviewer}
