@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/coder/websocket"
+
 	"github.com/unbot/work9flow/internal/protocol"
 )
 
@@ -110,6 +112,60 @@ func (c *Client) Steer(ctx context.Context, runID string, req protocol.SteerRequ
 // Followup queues a followup turn for a run.
 func (c *Client) Followup(ctx context.Context, runID string, req protocol.FollowupRequest) error {
 	return c.do(ctx, "POST", "/v1/runs/"+runID+"/followup", req, nil)
+}
+
+// SubscribeEvents opens a WebSocket to /v1/runs/{id}/events/stream
+// and returns a buffered channel of EventDTO plus a cancel func.
+// The channel is closed when the connection drops or cancel is called.
+// The first read may also receive historical events (seq > 0 if the
+// caller passed after > 0).
+//
+// Used by the TUI to live-update the detail/events views without
+// re-polling every pollInterval.
+func (c *Client) SubscribeEvents(ctx context.Context, runID string, after int64) (<-chan protocol.EventDTO, func(), error) {
+	u, err := url.Parse(c.base)
+	if err != nil {
+		return nil, nil, fmt.Errorf("client: bad base %q: %w", c.base, err)
+	}
+	u.Scheme = "ws"
+	u.Path = "/v1/runs/" + runID + "/events/stream"
+	if after > 0 {
+		q := u.Query()
+		q.Set("after", int64ToString(after))
+		u.RawQuery = q.Encode()
+	}
+	conn, _, err := websocket.Dial(ctx, u.String(), nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("client: ws dial: %w", err)
+	}
+	ch := make(chan protocol.EventDTO, 64)
+	cancel := func() {
+		_ = conn.Close(websocket.StatusNormalClosure, "client closed")
+	}
+	go func() {
+		defer close(ch)
+		defer cancel()
+		for {
+			// coder/websocket requires the read loop to also handle
+			// control frames. We use Read with a per-message deadline.
+			readCtx, readCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_, data, err := conn.Read(readCtx)
+			readCancel()
+			if err != nil {
+				return
+			}
+			var ev protocol.EventDTO
+			if err := json.Unmarshal(data, &ev); err != nil {
+				continue
+			}
+			select {
+			case ch <- ev:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch, cancel, nil
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
