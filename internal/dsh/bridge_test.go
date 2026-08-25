@@ -20,13 +20,14 @@ import (
 // HTTP API. It records each request and serves scripted responses so
 // tests can assert both sides of the wire without standing up Node.
 type fakeBridge struct {
-	mu          sync.Mutex
-	sessions    map[string]bool
-	prompts     map[string]int
-	script      []dsh.RawBridgeEvent // events to emit per session
-	closed      bool
-	shutdownHit bool
-	srv         *httptest.Server
+	mu                 sync.Mutex
+	sessions           map[string]bool
+	prompts            map[string]int
+	script             []dsh.RawBridgeEvent // events to emit per session
+	emitTransportError string               // non-empty → emit bridge.transport_error frame instead of script
+	closed             bool
+	shutdownHit        bool
+	srv                *httptest.Server
 }
 
 func newFakeBridge(t *testing.T) *fakeBridge {
@@ -76,8 +77,18 @@ func newFakeBridge(t *testing.T) *fakeBridge {
 			return
 		}
 		fb.mu.Lock()
+		transportErr := fb.emitTransportError
 		evs := append([]dsh.RawBridgeEvent(nil), fb.script...)
 		fb.mu.Unlock()
+		if transportErr != "" {
+			// Emit the explicit bridge transport-control frame, then
+			// close the stream. The Go reader must route this to errCh
+			// without Normalize() (which would mask it as raw.passthrough).
+			frame, _ := json.Marshal(map[string]string{"kind": "bridge.transport_error", "message": transportErr})
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", frame)
+			flusher.Flush()
+			return
+		}
 		for _, ev := range evs {
 			if ev.SessionID != "" && ev.SessionID != id {
 				continue
@@ -279,6 +290,49 @@ func TestNormalizeNilReceiver(t *testing.T) {
 	ev := raw.Normalize(time.Now())
 	if ev.Kind != domain.EventKindRawPassthrough {
 		t.Errorf("kind = %q, want raw.passthrough", ev.Kind)
+	}
+}
+
+func TestBridgeEventsRoutesTransportErrorToErrCh(t *testing.T) {
+	// Reviewer P1 #2: a plain HTTP EOF after the upstream pump catches
+	// an error is not enough — bufio.Scanner.Err() reports nil for a
+	// clean close, so the Runner would hang. The bridge emits an
+	// explicit bridge.transport_error control frame before closing;
+	// the Go reader must route it to errCh and stop reading, instead
+	// of letting Normalize() mask the failure as raw.passthrough.
+	fb := newFakeBridge(t)
+	fb.emitTransportError = "upstream_runtime_disconnected"
+	b := dsh.NewBridge(fb.srv.URL)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	evCh, errCh := b.Events(ctx, "sess-x")
+	var gotErr error
+	var gotEv dsh.NormalizedEvent
+	var sawEv, sawErr bool
+	for !(sawErr && sawEv || (sawErr && !sawEv)) {
+		select {
+		case gotEv, sawEv = <-evCh:
+			if !sawEv {
+				break
+			}
+		case gotErr, sawErr = <-errCh:
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for transport error: errCh=%v evCh=%v", sawErr, sawEv)
+		}
+	}
+	if !sawErr {
+		t.Fatalf("expected transport error on errCh; got normalized event %+v instead", gotEv)
+	}
+	if !strings.Contains(gotErr.Error(), "upstream_runtime_disconnected") {
+		t.Errorf("errCh message = %q, want it to include upstream_runtime_disconnected", gotErr.Error())
+	}
+	// And the stream must not deliver any NormalizedEvent for the failure.
+	select {
+	case ev, ok := <-evCh:
+		if ok {
+			t.Errorf("did not expect a NormalizedEvent for the transport error, got %+v", ev)
+		}
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 

@@ -184,6 +184,64 @@ test('POST /sessions 400 on missing fields', async () => {
   await bridge.close()
 })
 
+test('POST /sessions 409 on different route (initialized runtime is process-wide pinned)', async () => {
+  // Upstream DSH pins cwd/provider/model/maxTokens for the lifetime of
+  // the runtime process. The bridge MUST refuse a second /sessions with
+  // a different route; otherwise the SessionState would record the new
+  // params while the underlying runtime stays on the first spec.
+  const wire = { name: 'deepseek-harness-sdk-runtime', version: '0.1.1-rc.2' }
+  const bridge = new Bridge({
+    port: 0,
+    runtimeFactory: () => makeFakeRuntime({ serverInfo: wire }),
+  })
+  await bridge.listen()
+  const addr = (bridge as any).server.address()
+  const base = `http://127.0.0.1:${addr.port}`
+
+  const first = await jsonPost(`${base}/sessions`, {
+    cwd: '/repo-a', provider: 'deepseek', model: 'model-a',
+  })
+  assert.equal(first.status, 200)
+  assert.deepEqual(first.json.serverInfo, wire)
+
+  // Same route → 200 (subsequent /sessions on the same runtime is fine).
+  const same = await jsonPost(`${base}/sessions`, {
+    cwd: '/repo-a', provider: 'deepseek', model: 'model-a',
+  })
+  assert.equal(same.status, 200)
+
+  // Different cwd → 409.
+  const cwdDiff = await jsonPost(`${base}/sessions`, {
+    cwd: '/repo-b', provider: 'deepseek', model: 'model-a',
+  })
+  assert.equal(cwdDiff.status, 409)
+  assert.equal(cwdDiff.json.error, 'runtime_route_mismatch')
+  assert.match(cwdDiff.json.detail ?? '', /cwd:/)
+
+  // Different provider → 409.
+  const provDiff = await jsonPost(`${base}/sessions`, {
+    cwd: '/repo-a', provider: 'other', model: 'model-a',
+  })
+  assert.equal(provDiff.status, 409)
+  assert.match(provDiff.json.detail ?? '', /provider:/)
+
+  // Different model → 409.
+  const modelDiff = await jsonPost(`${base}/sessions`, {
+    cwd: '/repo-a', provider: 'deepseek', model: 'model-b',
+  })
+  assert.equal(modelDiff.status, 409)
+  assert.match(modelDiff.json.detail ?? '', /model:/)
+
+  // Different maxTokens → 409.
+  const mtDiff = await jsonPost(`${base}/sessions`, {
+    cwd: '/repo-a', provider: 'deepseek', model: 'model-a', maxTokens: 1024,
+  })
+  assert.equal(mtDiff.status, 409)
+  assert.match(mtDiff.json.detail ?? '', /maxTokens:/)
+
+  await bridge.close()
+})
+
 test('POST /sessions/:id/prompt returns messageId from upstream', async () => {
   let lastId = ''
   let lastBlocks: ContentBlock[] = []
@@ -278,6 +336,51 @@ test('GET /sessions/:id/events streams upstream notifications as SSE', async () 
   assert.equal((status as any).status, 'idle')
   assert.ok(started)
   assert.equal((started as any).childSessionId, 'c-1')
+
+  await bridge.close()
+})
+
+test('GET /sessions/:id/events emits bridge.transport_error when the subscription pump errors', async () => {
+  // Reviewer P1 #2: a plain HTTP EOF after the pump catches an error
+  // is not enough — Go bufio.Scanner.Err() reports nil for a clean
+  // close, so the Runner would hang waiting for an event that never
+  // arrives. The bridge must emit an explicit bridge.transport_error
+  // control frame BEFORE closing the stream so the Go side can route
+  // it to its typed transport-error channel.
+  const subs = new Map<string, FakeSubscription>()
+  const harness = makeFakeRuntime({
+    onSubscribe: (id) => {
+      let s = subs.get(id)
+      if (!s) { s = makeFakeSubscription(); subs.set(id, s) }
+      return s
+    },
+  })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => harness })
+  await bridge.listen()
+  const addr = (bridge as any).server.address()
+  const base = `http://127.0.0.1:${addr.port}`
+
+  const created = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })
+  const sid = created.json.sessionId
+
+  // Open SSE, then simulate a transport failure on the subscription
+  // (the upstream died). The bridge should emit a bridge.transport_error
+  // SSE frame before closing the stream.
+  const ctrl = new AbortController()
+  const collected = readSSE(`${base}/sessions/${sid}/events`, ctrl.signal)
+  await new Promise((r) => setTimeout(r, 50))
+  const sub = subs.get(sid)
+  assert.ok(sub, 'subscribe factory should have populated the test map')
+  sub.fail(new Error('upstream_runtime_disconnected'))
+  await new Promise((r) => setTimeout(r, 100))
+  ctrl.abort()
+  const out = await collected
+
+  const te = out.find((e) => (e as any).kind === 'bridge.transport_error') as
+    | { kind: 'bridge.transport_error'; message: string }
+    | undefined
+  assert.ok(te, 'expected a bridge.transport_error SSE frame after pump error')
+  assert.match(te.message, /upstream_runtime_disconnected/)
 
   await bridge.close()
 })

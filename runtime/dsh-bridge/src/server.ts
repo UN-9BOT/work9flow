@@ -109,6 +109,15 @@ export class Bridge {
   private readonly host: string
   private runtime: BridgeRuntime | undefined
   private starting: Promise<BridgeRuntime> | undefined
+  /**
+   * The exact spec the runtime was initialized with. Per upstream
+   * DSH semantics, cwd/provider/model/maxTokens pin the process for
+   * its lifetime, so every subsequent /sessions must match. See
+   * reviewer P1 #3 (route-mismatch): silently accepting a second
+   * /sessions with different params would record the new params on
+   * SessionState while the underlying runtime stayed on the first.
+   */
+  private initializedSpec: { cwd: string; provider: string; model: string; maxTokens?: number } | undefined
   private closing = false
   private readonly sessions = new Map<string, SessionState>()
   private readonly subscribers = new Map<string, Subscriber>()
@@ -209,6 +218,27 @@ export class Bridge {
     this.sessions.clear()
   }
 
+  /**
+   * Compare a /sessions request to the runtime's initialized spec.
+   * Returns null on match, or a stable mismatch description on diff.
+   * Omitting fields counts as "unset" — maxTokens undefined in both
+   * is a match. Used by handleCreateSession to fail fast with 409.
+   */
+  private routeDiff(req: CreateSessionRequest): string | null {
+    const spec = this.initializedSpec
+    if (!spec) return null
+    const reqCwd = resolvePath(req.cwd)
+    if (spec.cwd !== reqCwd) return `cwd: runtime=${spec.cwd} request=${reqCwd}`
+    if (spec.provider !== req.provider) return `provider: runtime=${spec.provider} request=${req.provider}`
+    if (spec.model !== req.model) return `model: runtime=${spec.model} request=${req.model}`
+    const specMax = spec.maxTokens
+    const reqMax = req.maxTokens
+    if ((specMax ?? null) !== (reqMax ?? null)) {
+      return `maxTokens: runtime=${specMax ?? 'unset'} request=${reqMax ?? 'unset'}`
+    }
+    return null
+  }
+
   /** Lazy runtime start with initialize handshake. */
   private async ensureRuntime(req: CreateSessionRequest): Promise<BridgeRuntime> {
     if (this.runtime) return this.runtime
@@ -218,6 +248,15 @@ export class Bridge {
       const factory = this.opts.runtimeFactory ?? ((r) => this.defaultRuntimeFactory(r))
       const runtime = await factory(req)
       await runtime.start() // no-op for default factory (already initialized)
+      // Pin the exact spec the runtime was initialized with. Per upstream
+      // DSH semantics, cwd/provider/model/maxTokens are process-wide and
+      // cannot be re-initialized; this is the only honest contract.
+      this.initializedSpec = {
+        cwd: resolvePath(req.cwd),
+        provider: req.provider,
+        model: req.model,
+        ...(req.maxTokens !== undefined ? { maxTokens: req.maxTokens } : {}),
+      }
       return runtime
     })()
 
@@ -280,6 +319,21 @@ export class Bridge {
     if (!body?.cwd || !body.provider || !body.model) {
       sendJson(res, 400, { error: 'missing fields: cwd, provider, model' }); return
     }
+    // If a runtime is already initialized (or is initializing for a
+    // different spec), reject the new /sessions up front. We cannot
+    // ask the upstream to re-initialize — that would violate the
+    // process-wide pin and silently leave the runtime on the old
+    // spec while SessionState records the new one.
+    if (this.initializedSpec) {
+      const diff = this.routeDiff(body)
+      if (diff) {
+        sendJson(res, 409, {
+          error: 'runtime_route_mismatch',
+          detail: `DSH runtime is initialized with a different route; one bridge = one initialize. (${diff})`,
+        })
+        return
+      }
+    }
     const runtime = await this.ensureRuntime(body)
     const sessionId = `s-${randomUUID().replaceAll('-', '').slice(0, 16)}`
     this.sessions.set(sessionId, {
@@ -336,6 +390,7 @@ export class Bridge {
     this.subscribers.set(subId, sub)
 
     const pump = async (): Promise<void> => {
+      let transportErr: unknown
       try {
         for await (const notification of subscription) {
           if (!this.subscribers.has(subId)) break
@@ -348,18 +403,25 @@ export class Bridge {
           res.write(`data: ${JSON.stringify(ev)}\n\n`)
         }
       } catch (err) {
-        // Pump failure is a transport-level error, NOT a domain event.
-        // Skip the spurious `bridge.error` SSE frame (it would land as
-        // raw.passthrough on the Go side and the Runner would keep
-        // polling instead of surfacing the failure). Just close the
-        // stream; Go's scanner.Err() will report the original error
-        // through errCh.
-        if (this.subscribers.has(subId)) {
-          this.subscribers.delete(subId)
-        }
-        // Best-effort log; in production this goes to the configured onError.
-        try { this.opts.onError?.(err) } catch {}
+        // A clean EOF (subscription closed without error) is NOT a
+        // transport failure and must not produce a transport_error
+        // frame. Any thrown error here means the upstream runtime or
+        // the SSE pipe itself broke: capture it so the finally block
+        // can emit an explicit bridge.transport_error control frame.
+        transportErr = err
       } finally {
+        if (transportErr !== undefined) {
+          // Surface the failure as an explicit control frame BEFORE
+          // closing the stream. A plain EOF is not enough: Go's
+          // bufio.Scanner.Err() reports nil for a clean close, so the
+          // Runner would just hang waiting for an event that never
+          // arrives. The Go side routes this frame to a typed
+          // transport-error channel instead of Normalize().
+          try {
+            const msg = (transportErr instanceof Error ? transportErr.message : String(transportErr)) || 'subscription_pump_error'
+            res.write(`data: ${JSON.stringify({ kind: 'bridge.transport_error', message: msg } satisfies BridgeEvent)}\n\n`)
+          } catch { /* res may already be torn down */ }
+        }
         subscription.close()
         this.subscribers.delete(subId)
         try { res.end() } catch {}

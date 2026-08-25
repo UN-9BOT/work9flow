@@ -359,6 +359,27 @@ func (b *Bridge) readSSE(ctx context.Context, resp *http.Response, evCh chan<- N
 			}
 			payload := dataBuf.Bytes()
 			dataBuf.Reset()
+			// Bridge transport-control frame: emitted by the bridge when
+			// the upstream subscription pump errors out. We route it to
+			// the typed errCh and stop reading, instead of passing it
+			// through Normalize() (which would mask the failure as a
+			// domain raw.passthrough and leave the Runner waiting for
+			// an event that will never arrive). See reviewer P1 #2.
+			var ctrl struct {
+				Kind    string `json:"kind"`
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(payload, &ctrl); err == nil && ctrl.Kind == "bridge.transport_error" {
+				msg := ctrl.Message
+				if msg == "" {
+					msg = "dsh: bridge reported transport error"
+				}
+				select {
+				case errCh <- fmt.Errorf("%s", msg):
+				default:
+				}
+				return
+			}
 			var raw RawBridgeEvent
 			if err := json.Unmarshal(payload, &raw); err != nil {
 				select {

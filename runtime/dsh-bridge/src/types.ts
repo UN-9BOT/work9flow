@@ -75,6 +75,20 @@ export type BridgeEvent =
       kind: 'bridge.error'
       message: string
     }
+  /**
+   * Transport-level failure surfaced by the bridge when its upstream
+   * subscription (SSE → session.event) errors out. The Go side MUST
+   * route this frame to the typed transport error channel instead of
+   * Normalize() (which would mask the failure as raw.passthrough and
+   * leave the Runner waiting for an event that will never arrive).
+   * A plain HTTP EOF is NOT sufficient: bufio.Scanner.Err() reports
+   * nil for a clean close, so the bridge must emit this explicit
+   * control frame before closing the stream.
+   */
+  | {
+      kind: 'bridge.transport_error'
+      message: string
+    }
 
 /** Health payload. */
 export interface HealthResponse {
