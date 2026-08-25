@@ -43,6 +43,9 @@ healthcheck: build ##  # non-interactive TUI run
 smoke: build ##  # boot runtime, exercise endpoints, shut down
 	@./scripts/smoke.sh $(ADDR)
 
+smoke-full: build ##  # boot inline DSH + scripted provider, drive run to DONE
+	@./scripts/smoke-full.sh $(ADDR)
+
 clean: ##  # remove ./bin
 	unlink -f $(BIN_DIR)/work9flowd $(BIN_DIR)/work9flow 2>/dev/null || true
 	rmdir $(BIN_DIR) 2>/dev/null || true
