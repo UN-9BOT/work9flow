@@ -1,19 +1,16 @@
 /**
- * Pin the project-local npm registry to canonical npmjs.com.
+ * Pin the project-local npm registry to npmmirror.com.
  *
- * Per user decision (reviewer P1 #4 — work9flow-8w0 feedback) and
- * foundation policy: dependencies with shell/filesystem capabilities
- * (the @deepseek-ai/dsh-sdk-* packages) MUST NOT be silently swapped
- * across registries. Operator-local ~/.npmrc may point anywhere
- * (e.g. registry.npmmirror.com), but the project's runtime/dsh-bridge
- * sub-package pins its OWN .npmrc to canonical registry.npmjs.org so
- * a fresh `npm install` is reproducible across machines.
+ * Per bead work9flow-azy (dsh-A.10g, P1): the runtime/dsh-bridge
+ * sub-package depends on @deepseek-ai/dsh-sdk-* (0.1.1-rc.2), which
+ * carries shell/filesystem capabilities via the spawned
+ * dsh-jsonrpc-agent subprocess. Pin the registry so a fresh
+ * `npm install` is reproducible and doesn't silently drift when the
+ * operator's ~/.npmrc changes.
  *
- * Note: this bead does NOT regenerate package-lock.json — the existing
- * lockfile's `resolved` URLs may still point at a different mirror if
- * they were generated when ~/.npmrc was set to that mirror. Future
- * `npm install` runs from this directory will rewrite those URLs to
- * canonical. That regeneration is tracked separately.
+ * Operator decision (2026-08-26): pin to the registry that matches
+ * the rest of the dependency snapshot already in package-lock.json
+ * (registry.npmmirror.com — confirmed via grep on the lockfile).
  */
 import { readFileSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
@@ -31,12 +28,12 @@ test('.npmrc exists in runtime/dsh-bridge/', () => {
   )
 })
 
-test('.npmrc pins registry to canonical npmjs.com', () => {
+test('.npmrc pins registry to npmmirror.com', () => {
   const content = readFileSync(npmrcPath, 'utf8')
   assert.match(
     content,
-    /^registry\s*=\s*https:\/\/registry\.npmjs\.org\//m,
-    '.npmrc must pin registry=https://registry.npmjs.org/ — see work9flow-azy',
+    /^registry\s*=\s*https:\/\/registry\.npmmirror\.com\//m,
+    '.npmrc must pin registry=https://registry.npmmirror.com/ — see work9flow-azy',
   )
 })
 
