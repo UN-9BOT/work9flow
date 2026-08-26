@@ -82,7 +82,7 @@ fallback.
 
 ```bash
 cd runtime/dsh-bridge
-npm install
+npm install          # uses project-local .npmrc (canonical npmjs.com)
 DSH_CORDIS_CONFIG=/path/to/cordis.yml npm run build && npm start
 ```
 
@@ -98,7 +98,7 @@ npm start
 ## Test
 
 ```bash
-npm test          # 26 tests, no runtime needed
+npm test          # 29 tests, no runtime needed
 ```
 
 The HTTP-layer tests use a `harnessFactory` injection — a fake
