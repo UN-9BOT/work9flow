@@ -91,8 +91,6 @@ func main() {
 	}
 
 	if ar != nil {
-		ar.PollInterval = 5 * time.Second
-		ar.PollBudget = 60 * time.Second
 		eng = engine.New(engine.Option{Repo: repo})
 		if err := eng.RegisterWorkflow(featuredev.Workflow(ar)); err != nil {
 			logger.Fatal("register feature-development workflow", "err", err)

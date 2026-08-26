@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/unbot/work9flow/internal/agents"
 	"github.com/unbot/work9flow/internal/domain"
@@ -21,31 +20,32 @@ import (
 	"github.com/unbot/work9flow/internal/storage"
 )
 
-// eventFrame wraps one upstream notification kind into a session.event
-// SSE frame so test scripts can describe agent emissions directly.
-func eventFrame(sid, innerKind string, data json.RawMessage) dsh.RawBridgeEvent {
-    inner, _ := json.Marshal(map[string]any{"kind": innerKind, "data": data})
-    return dsh.RawBridgeEvent{Kind: "session.event", SessionID: sid, Event: inner}
+// assistantFrame wraps the upstream assistant/message envelope so test
+// scripts can describe the agent's final response directly. The work9flow
+// contract JSON (outcome / findings / etc.) is embedded in the text
+// content block — same shape upstream HarnessSession.run emits.
+func assistantFrame(sid, text string) dsh.RawBridgeEvent {
+    b, _ := json.Marshal(text)
+    return dsh.RawBridgeEvent{
+        Type:      "assistant/message",
+        SessionID: sid,
+        Data:      json.RawMessage(`{"message":{"content":[{"type":"text","text":` + string(b) + `}]}}`),
+    }
 }
 
-// defaultAdvanceScript returns a DSH script where every agent emits
-// a single agent.completed event with outcome=advance. This lets the
-// engine tests below drive the full Scout -> Planner -> Gatekeeper ->
-// WAITING_FOR_USER path without caring about agent payloads.
+// defaultAdvanceScript returns a DSH script where every agent emits a
+// single upstream assistant/message with outcome=advance. The Activity
+// stream is bounded by the bridge's run.end{reason=idle} (added by the
+// scriptedDSH mock). This lets the engine tests below drive the full
+// Scout -> Planner -> Gatekeeper -> Implementer -> Reviewer path
+// without caring about agent payloads.
 func defaultAdvanceScript() map[string][]dsh.RawBridgeEvent {
-	makeEv := func(role, summary string) []dsh.RawBridgeEvent {
-		sid := "sess-" + role
-		return []dsh.RawBridgeEvent{
-			eventFrame(sid, "agent.started", json.RawMessage(fmt.Sprintf(`{"role":%q}`, role))),
-			eventFrame(sid, "agent.completed", json.RawMessage(fmt.Sprintf(`{"outcome":"advance","summary":%q}`, summary))),
-		}
-	}
 	return map[string][]dsh.RawBridgeEvent{
-		"sess-1":       makeEv("scout", "scout done"),
-		"sess-2":     makeEv("planner", "planner done"),
-		"sess-3":  makeEv("gatekeeper", "gatekeeper done"),
-		"sess-4": makeEv("implementer", "implementer done"),
-		"sess-5":    makeEv("reviewer", "reviewer done"),
+		"sess-1":    {assistantFrame("sess-1", `{"outcome":"advance","summary":"scout done"}`)},
+		"sess-2":    {assistantFrame("sess-2", `{"outcome":"advance","summary":"planner done"}`)},
+		"sess-3":    {assistantFrame("sess-3", `{"outcome":"advance","summary":"gatekeeper done"}`)},
+		"sess-4":    {assistantFrame("sess-4", `{"outcome":"advance","summary":"implementer done"}`)},
+		"sess-5":    {assistantFrame("sess-5", `{"outcome":"advance","summary":"reviewer done"}`)},
 	}
 }
 
@@ -93,6 +93,34 @@ func (s *scriptedDSH) handler() http.Handler {
 			"sessionId": id,
 			"serverInfo": map[string]string{"name": "scripted-dsh", "version": "test"},
 		})
+	})
+	// /run — owned Activity interval. Emits run.start with messageId,
+	// forwards scripted upstream notifications, then closes with
+	// run.end{reason=idle}.
+	mux.HandleFunc("POST /sessions/{id}/run", func(w http.ResponseWriter, r *http.Request) {
+		sid := r.PathValue("id")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "close")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		s.mu.Lock()
+		evs := append([]dsh.RawBridgeEvent(nil), s.script[sid]...)
+		s.mu.Unlock()
+		write := func(ev dsh.RawBridgeEvent) {
+			b, _ := json.Marshal(ev)
+			_, _ = w.Write([]byte("data: "))
+			_, _ = w.Write(b)
+			_, _ = w.Write([]byte("\n\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		write(dsh.RawBridgeEvent{Type: "run.start", MessageID: "msg-" + sid})
+		for _, e := range evs {
+			write(e)
+		}
+		write(dsh.RawBridgeEvent{Type: "run.end", Reason: "idle"})
 	})
 	mux.HandleFunc("POST /sessions/{id}/prompt", func(w http.ResponseWriter, _ *http.Request) {
 		// Stable enqueue receipt; the runner records it but does not inspect it.
@@ -143,8 +171,7 @@ func newAgentEngine(t *testing.T, script map[string][]dsh.RawBridgeEvent) (*engi
 	srv := httptest.NewServer(mock.handler())
 	c := dsh.NewBridge(srv.URL)
 	r := agents.New(c, repo)
-	r.PollInterval = 5 * time.Millisecond
-	r.PollBudget = 500 * time.Millisecond
+
 	eng := engine.New(engine.Option{Repo: repo})
 	if err := eng.RegisterWorkflow(featuredev.Workflow(r)); err != nil {
 		t.Fatal(err)
@@ -382,8 +409,7 @@ func TestEngineSurvivesRestart(t *testing.T) {
 	defer srv1.Close()
 	c1 := dsh.NewBridge(srv1.URL)
 	runner1 := agents.New(c1, r1)
-	runner1.PollInterval = 5 * time.Millisecond
-	runner1.PollBudget = 500 * time.Millisecond
+
 	eng1 := engine.New(engine.Option{Repo: r1})
 	_ = eng1.RegisterWorkflow(featuredev.Workflow(runner1))
 	run, _ := eng1.CreateRun(context.Background(), engine.CreateRunInput{
@@ -428,7 +454,7 @@ func TestFeaturedevScoutPersistsArtifacts(t *testing.T) {
 	// at version 1 of its (kind, name) tuple.
 	script := map[string][]dsh.RawBridgeEvent{
 		"sess-1": {
-			eventFrame("sess-1", "agent.completed", json.RawMessage(`{
+			assistantFrame("sess-1", `{
 				"outcome":"advance",
 				"artifacts":[
 					{"kind":"evidence","name":"breadcrumbs.json","stage":"discovery","content":"# bread"},
@@ -436,7 +462,7 @@ func TestFeaturedevScoutPersistsArtifacts(t *testing.T) {
 					{"kind":"evidence","name":"sources.json","stage":"discovery","content":"{}"},
 					{"kind":"evidence","name":"skills.json","stage":"discovery","content":"[]"}
 				]
-			}`)),
+			}`),
 		},
 	}
 	eng, repo, _, stop := newAgentEngine(t, script)
@@ -466,9 +492,9 @@ func TestFeaturedevScoutPersistsArtifacts(t *testing.T) {
 
 func TestFeaturedevGatekeeperApprove(t *testing.T) {
 	eng, repo, _, stop := newAgentEngine(t, map[string][]dsh.RawBridgeEvent{
-		"sess-1":      []dsh.RawBridgeEvent{eventFrame("sess-1", "agent.completed", json.RawMessage(`{"outcome":"advance"}`))},
-		"sess-2":    []dsh.RawBridgeEvent{eventFrame("sess-2", "agent.completed", json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`))},
-		"sess-3": []dsh.RawBridgeEvent{eventFrame("sess-3", "agent.completed", json.RawMessage(`{"outcome":"approve"}`))},
+		"sess-1":      []dsh.RawBridgeEvent{assistantFrame("sess-1", `{"outcome":"advance"}`)},
+		"sess-2":    []dsh.RawBridgeEvent{assistantFrame("sess-2", `{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`)},
+		"sess-3": []dsh.RawBridgeEvent{assistantFrame("sess-3", `{"outcome":"approve"}`)},
 	})
 	defer stop()
 	run := mustCreateRun(t, eng, "feature-development", "x")
@@ -495,13 +521,13 @@ func TestFeaturedevGatekeeperReviseLoopsBack(t *testing.T) {
 	// a scripted planner that emits two sets of artifacts.
 	_, repo, _, stop := newAgentEngine(t, map[string][]dsh.RawBridgeEvent{
 		"sess-2": {
-			eventFrame("sess-2", "agent.completed", json.RawMessage(`{
+			assistantFrame("sess-2", `{
 				"outcome":"advance",
 				"artifacts":[
 					{"kind":"spec","name":"feature-spec.md","content":"v1"},
 					{"kind":"plan","name":"implementation-plan.md","content":"v1"}
 				]
-			}`)),
+			}`),
 		},
 	})
 	defer stop()
@@ -564,9 +590,9 @@ func TestFeaturedevGatekeeperReviseLoopsBack(t *testing.T) {
 
 func TestFeaturedevGatekeeperWaitUserCreatesAttention(t *testing.T) {
 	eng, repo, _, stop := newAgentEngine(t, map[string][]dsh.RawBridgeEvent{
-		"sess-1":      []dsh.RawBridgeEvent{eventFrame("sess-1", "agent.completed", json.RawMessage(`{"outcome":"advance"}`))},
-		"sess-2":    []dsh.RawBridgeEvent{eventFrame("sess-2", "agent.completed", json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`))},
-		"sess-3": []dsh.RawBridgeEvent{eventFrame("sess-3", "agent.completed", json.RawMessage(`{"outcome":"wait_user","questions":["which DB?","which auth?"]}`))},
+		"sess-1":      []dsh.RawBridgeEvent{assistantFrame("sess-1", `{"outcome":"advance"}`)},
+		"sess-2":    []dsh.RawBridgeEvent{assistantFrame("sess-2", `{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`)},
+		"sess-3": []dsh.RawBridgeEvent{assistantFrame("sess-3", `{"outcome":"wait_user","questions":["which DB?","which auth?"]}`)},
 	})
 	defer stop()
 	run := mustCreateRun(t, eng, "feature-development", "x")
@@ -593,9 +619,9 @@ func TestFeaturedevGatekeeperWaitUserCreatesAttention(t *testing.T) {
 
 func TestFeaturedevGatekeeperFailedMarksRunFailed(t *testing.T) {
 	eng, repo, _, stop := newAgentEngine(t, map[string][]dsh.RawBridgeEvent{
-		"sess-1":      []dsh.RawBridgeEvent{eventFrame("sess-1", "agent.completed", json.RawMessage(`{"outcome":"advance"}`))},
-		"sess-2":    []dsh.RawBridgeEvent{eventFrame("sess-2", "agent.completed", json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`))},
-		"sess-3": []dsh.RawBridgeEvent{eventFrame("sess-3", "agent.completed", json.RawMessage(`{"outcome":"failed","summary":"nope"}`))},
+		"sess-1":      []dsh.RawBridgeEvent{assistantFrame("sess-1", `{"outcome":"advance"}`)},
+		"sess-2":    []dsh.RawBridgeEvent{assistantFrame("sess-2", `{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`)},
+		"sess-3": []dsh.RawBridgeEvent{assistantFrame("sess-3", `{"outcome":"failed","summary":"nope"}`)},
 	})
 	defer stop()
 	run := mustCreateRun(t, eng, "feature-development", "x")
@@ -617,10 +643,10 @@ func TestFeaturedevGatekeeperFailedMarksRunFailed(t *testing.T) {
 
 func TestFeaturedevImplementerRunsAndAdvancesToReview(t *testing.T) {
 	eng, repo, _, stop := newAgentEngine(t, map[string][]dsh.RawBridgeEvent{
-		"sess-1":       []dsh.RawBridgeEvent{eventFrame("sess-1", "agent.completed", json.RawMessage(`{"outcome":"advance"}`))},
-		"sess-2":     []dsh.RawBridgeEvent{eventFrame("sess-2", "agent.completed", json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`))},
-		"sess-3":  []dsh.RawBridgeEvent{eventFrame("sess-3", "agent.completed", json.RawMessage(`{"outcome":"approve"}`))},
-		"sess-4": []dsh.RawBridgeEvent{eventFrame("sess-4", "agent.completed", json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"other","name":"diff-summary.md","stage":"implementing","content":"changed a/b/c"}]}`))},
+		"sess-1":       []dsh.RawBridgeEvent{assistantFrame("sess-1", `{"outcome":"advance"}`)},
+		"sess-2":     []dsh.RawBridgeEvent{assistantFrame("sess-2", `{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`)},
+		"sess-3":  []dsh.RawBridgeEvent{assistantFrame("sess-3", `{"outcome":"approve"}`)},
+		"sess-4": []dsh.RawBridgeEvent{assistantFrame("sess-4", `{"outcome":"advance","artifacts":[{"kind":"other","name":"diff-summary.md","stage":"implementing","content":"changed a/b/c"}]}`)},
 	})
 	defer stop()
 	run := mustCreateRun(t, eng, "feature-development", "x")
@@ -643,11 +669,11 @@ func TestFeaturedevImplementerRunsAndAdvancesToReview(t *testing.T) {
 
 func TestFeaturedevReviewerApproveReachesDone(t *testing.T) {
 	eng, repo, _, stop := newAgentEngine(t, map[string][]dsh.RawBridgeEvent{
-		"sess-1":       []dsh.RawBridgeEvent{eventFrame("sess-1", "agent.completed", json.RawMessage(`{"outcome":"advance"}`))},
-		"sess-2":     []dsh.RawBridgeEvent{eventFrame("sess-2", "agent.completed", json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`))},
-		"sess-3":  []dsh.RawBridgeEvent{eventFrame("sess-3", "agent.completed", json.RawMessage(`{"outcome":"approve"}`))},
-		"sess-4": []dsh.RawBridgeEvent{eventFrame("sess-4", "agent.completed", json.RawMessage(`{"outcome":"advance"}`))},
-		"sess-5":    []dsh.RawBridgeEvent{eventFrame("sess-5", "agent.completed", json.RawMessage(`{"outcome":"approve","summary":"clean"}`))},
+		"sess-1":       []dsh.RawBridgeEvent{assistantFrame("sess-1", `{"outcome":"advance"}`)},
+		"sess-2":     []dsh.RawBridgeEvent{assistantFrame("sess-2", `{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`)},
+		"sess-3":  []dsh.RawBridgeEvent{assistantFrame("sess-3", `{"outcome":"approve"}`)},
+		"sess-4": []dsh.RawBridgeEvent{assistantFrame("sess-4", `{"outcome":"advance"}`)},
+		"sess-5":    []dsh.RawBridgeEvent{assistantFrame("sess-5", `{"outcome":"approve","summary":"clean"}`)},
 	})
 	defer stop()
 	run := mustCreateRun(t, eng, "feature-development", "ship it")
@@ -666,17 +692,17 @@ func TestFeaturedevReviewerReviseLoopsBackToImplementing(t *testing.T) {
 	// Reviewer emits one IMPLEMENTATION_BUG finding and outcome=revise.
 	// The engine must route the run back to IMPLEMENTING.
 	eng, repo, _, stop := newAgentEngine(t, map[string][]dsh.RawBridgeEvent{
-		"sess-1":       []dsh.RawBridgeEvent{eventFrame("sess-1", "agent.completed", json.RawMessage(`{"outcome":"advance"}`))},
-		"sess-2":     []dsh.RawBridgeEvent{eventFrame("sess-2", "agent.completed", json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`))},
-		"sess-3":  []dsh.RawBridgeEvent{eventFrame("sess-3", "agent.completed", json.RawMessage(`{"outcome":"approve"}`))},
-		"sess-4": []dsh.RawBridgeEvent{eventFrame("sess-4", "agent.completed", json.RawMessage(`{"outcome":"advance"}`))},
+		"sess-1":       []dsh.RawBridgeEvent{assistantFrame("sess-1", `{"outcome":"advance"}`)},
+		"sess-2":     []dsh.RawBridgeEvent{assistantFrame("sess-2", `{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`)},
+		"sess-3":  []dsh.RawBridgeEvent{assistantFrame("sess-3", `{"outcome":"approve"}`)},
+		"sess-4": []dsh.RawBridgeEvent{assistantFrame("sess-4", `{"outcome":"advance"}`)},
 		"sess-5": []dsh.RawBridgeEvent{
-			eventFrame("sess-5", "agent.completed", json.RawMessage(`{
+			assistantFrame("sess-5", `{
 				"outcome":"revise",
 				"review_findings":[
 					{"class":"IMPLEMENTATION_BUG","statement":"missing error check"}
 				]
-			}`)),
+			}`),
 		},
 	})
 	defer stop()
@@ -701,17 +727,17 @@ func TestFeaturedevReviewerReviseLoopsBackToImplementing(t *testing.T) {
 
 func TestFeaturedevReviewerRevisePlanRoutesBackToPlanReview(t *testing.T) {
 	eng, repo, _, stop := newAgentEngine(t, map[string][]dsh.RawBridgeEvent{
-		"sess-1":       []dsh.RawBridgeEvent{eventFrame("sess-1", "agent.completed", json.RawMessage(`{"outcome":"advance"}`))},
-		"sess-2":     []dsh.RawBridgeEvent{eventFrame("sess-2", "agent.completed", json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`))},
-		"sess-3":  []dsh.RawBridgeEvent{eventFrame("sess-3", "agent.completed", json.RawMessage(`{"outcome":"approve"}`))},
-		"sess-4": []dsh.RawBridgeEvent{eventFrame("sess-4", "agent.completed", json.RawMessage(`{"outcome":"advance"}`))},
+		"sess-1":       []dsh.RawBridgeEvent{assistantFrame("sess-1", `{"outcome":"advance"}`)},
+		"sess-2":     []dsh.RawBridgeEvent{assistantFrame("sess-2", `{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`)},
+		"sess-3":  []dsh.RawBridgeEvent{assistantFrame("sess-3", `{"outcome":"approve"}`)},
+		"sess-4": []dsh.RawBridgeEvent{assistantFrame("sess-4", `{"outcome":"advance"}`)},
 		"sess-5": []dsh.RawBridgeEvent{
-			eventFrame("sess-5", "agent.completed", json.RawMessage(`{
+			assistantFrame("sess-5", `{
 				"outcome":"revise_plan",
 				"review_findings":[
 					{"class":"PLAN_DEFECT","statement":"step 2 is unbuildable"}
 				]
-			}`)),
+			}`),
 		},
 	})
 	defer stop()
@@ -729,17 +755,17 @@ func TestFeaturedevReviewerRevisePlanRoutesBackToPlanReview(t *testing.T) {
 
 func TestFeaturedevReviewerWaitUserCreatesAttention(t *testing.T) {
 	eng, repo, _, stop := newAgentEngine(t, map[string][]dsh.RawBridgeEvent{
-		"sess-1":       []dsh.RawBridgeEvent{eventFrame("sess-1", "agent.completed", json.RawMessage(`{"outcome":"advance"}`))},
-		"sess-2":     []dsh.RawBridgeEvent{eventFrame("sess-2", "agent.completed", json.RawMessage(`{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`))},
-		"sess-3":  []dsh.RawBridgeEvent{eventFrame("sess-3", "agent.completed", json.RawMessage(`{"outcome":"approve"}`))},
-		"sess-4": []dsh.RawBridgeEvent{eventFrame("sess-4", "agent.completed", json.RawMessage(`{"outcome":"advance"}`))},
+		"sess-1":       []dsh.RawBridgeEvent{assistantFrame("sess-1", `{"outcome":"advance"}`)},
+		"sess-2":     []dsh.RawBridgeEvent{assistantFrame("sess-2", `{"outcome":"advance","artifacts":[{"kind":"spec","name":"feature-spec.md","content":"s"},{"kind":"plan","name":"implementation-plan.md","content":"p"}]}`)},
+		"sess-3":  []dsh.RawBridgeEvent{assistantFrame("sess-3", `{"outcome":"approve"}`)},
+		"sess-4": []dsh.RawBridgeEvent{assistantFrame("sess-4", `{"outcome":"advance"}`)},
 		"sess-5": []dsh.RawBridgeEvent{
-			eventFrame("sess-5", "agent.completed", json.RawMessage(`{
+			assistantFrame("sess-5", `{
 				"outcome":"wait_user",
 				"review_findings":[
 					{"class":"REQUIREMENT_AMBIGUITY","statement":"what status codes for invalid input?"}
 				]
-			}`)),
+			}`),
 		},
 	})
 	defer stop()

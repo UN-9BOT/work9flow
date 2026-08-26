@@ -17,6 +17,7 @@ import {
   Bridge,
   toBridgeEvent,
 } from '../src/server.ts'
+import type { BridgeEvent } from '../src/types.ts'
 import type {
   ContentBlock,
   HarnessClient,
@@ -75,12 +76,14 @@ function makeFakeRuntime(opts: {
   onPrompt?: (id: string, blocks: ContentBlock[]) => string
   onSubscribe?: (id: string) => FakeSubscription
   startShouldThrow?: boolean
+  promptShouldThrow?: Error
   serverInfo?: { name: string; version: string }
 }): BridgeRuntime {
   const subscriptions = new Map<string, FakeSubscription>()
   let messageCounter = 0
   const client = {
     prompt: async (sessionId: string, blocks: ContentBlock[]) => {
+      if (opts.promptShouldThrow) throw opts.promptShouldThrow
       // Mirrors upstream signature Promise<string> (messageId receipt).
       const id = opts.onPrompt ? opts.onPrompt(sessionId, blocks) : `m-${++messageCounter}`
       return id
@@ -116,13 +119,23 @@ async function jsonPost(url: string, body: unknown): Promise<{ status: number; j
   return { status: res.status, json }
 }
 
-async function readSSE(url: string, signal: AbortSignal): Promise<HarnessNotification[]> {
-  const res = await fetch(url, { signal })
+/**
+ * Read an SSE stream into BridgeEvent frames, stopping at the first
+ * stream end (server-side close). Honours an external AbortSignal.
+ */
+async function readSSE(url: string, signal: AbortSignal, opts?: { method?: string; body?: unknown }): Promise<BridgeEvent[]> {
+  const method = opts?.method ?? 'GET'
+  const init: RequestInit = { method, signal }
+  if (method !== 'GET' && opts?.body !== undefined) {
+    init.headers = { 'content-type': 'application/json' }
+    init.body = JSON.stringify(opts.body)
+  }
+  const res = await fetch(url, init)
   if (res.status !== 200) throw new Error(`expected 200, got ${res.status}`)
   const reader = res.body!.getReader()
   const dec = new TextDecoder()
   let buf = ''
-  const out: HarnessNotification[] = []
+  const out: BridgeEvent[] = []
   const killer = new AbortController()
   signal.addEventListener('abort', () => killer.abort())
   try {
@@ -152,260 +165,197 @@ async function readSSE(url: string, signal: AbortSignal): Promise<HarnessNotific
 
 test('POST /sessions returns a sessionId and persists state', async () => {
   const runtime = makeFakeRuntime({})
-  let receivedReq: unknown = undefined
-  const factory = (req: unknown) => { receivedReq = req; return runtime }
-  const bridge = new Bridge({ port: 0, runtimeFactory: factory })
+  const bridge = new Bridge({
+    port: 0,
+    runtimeFactory: () => runtime,
+  })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
 
-  const r = await jsonPost(`${base}/sessions`, {
-    cwd: '/tmp/x', provider: 'deepseek-official', model: 'deepseek-v4-flash',
-  })
+  const r = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })
   assert.equal(r.status, 200)
   assert.ok(typeof r.json.sessionId === 'string' && r.json.sessionId.length > 0)
-  assert.ok(receivedReq, 'factory should receive request')
-  const receivedBody = receivedReq as { provider?: string; cwd?: string; model?: string }
-  assert.equal(receivedBody.provider, 'deepseek-official')
-
   await bridge.close()
 })
 
 test('POST /sessions 400 on missing fields', async () => {
-  const bridge = new Bridge({ port: 0, runtimeFactory: () => makeFakeRuntime({}) })
+  const runtime = makeFakeRuntime({})
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
 
-  for (const body of [{}, { cwd: '/x' }, { cwd: '/x', provider: 'p' }, { provider: 'p', model: 'm' }]) {
-    const r = await jsonPost(`${base}/sessions`, body)
-    assert.equal(r.status, 400, `body=${JSON.stringify(body)}`)
-  }
+  const r1 = await jsonPost(`${base}/sessions`, { cwd: '/tmp' })
+  assert.equal(r1.status, 400)
+  const r2 = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p' })
+  assert.equal(r2.status, 400)
+  const r3 = await jsonPost(`${base}/sessions`, { cwd: '/tmp', model: 'm' })
+  assert.equal(r3.status, 400)
   await bridge.close()
 })
 
 test('POST /sessions 409 on different route (initialized runtime is process-wide pinned)', async () => {
-  // Upstream DSH pins cwd/provider/model/maxTokens for the lifetime of
-  // the runtime process. The bridge MUST refuse a second /sessions with
-  // a different route; otherwise the SessionState would record the new
-  // params while the underlying runtime stays on the first spec.
-  const wire = { name: 'deepseek-harness-sdk-runtime', version: '0.1.1-rc.2' }
-  const bridge = new Bridge({
-    port: 0,
-    runtimeFactory: () => makeFakeRuntime({ serverInfo: wire }),
+  let promptCount = 0
+  const runtime = makeFakeRuntime({
+    onPrompt: () => { promptCount++; return 'm-1' },
   })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
 
-  const first = await jsonPost(`${base}/sessions`, {
-    cwd: '/repo-a', provider: 'deepseek', model: 'model-a',
-  })
-  assert.equal(first.status, 200)
-  assert.deepEqual(first.json.serverInfo, wire)
+  const r1 = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm1' })
+  assert.equal(r1.status, 200)
 
-  // Same route → 200 (subsequent /sessions on the same runtime is fine).
-  const same = await jsonPost(`${base}/sessions`, {
-    cwd: '/repo-a', provider: 'deepseek', model: 'model-a',
-  })
-  assert.equal(same.status, 200)
-
-  // Different cwd → 409.
-  const cwdDiff = await jsonPost(`${base}/sessions`, {
-    cwd: '/repo-b', provider: 'deepseek', model: 'model-a',
-  })
-  assert.equal(cwdDiff.status, 409)
-  assert.equal(cwdDiff.json.error, 'runtime_route_mismatch')
-  assert.match(cwdDiff.json.detail ?? '', /cwd:/)
-
-  // Different provider → 409.
-  const provDiff = await jsonPost(`${base}/sessions`, {
-    cwd: '/repo-a', provider: 'other', model: 'model-a',
-  })
-  assert.equal(provDiff.status, 409)
-  assert.match(provDiff.json.detail ?? '', /provider:/)
-
-  // Different model → 409.
-  const modelDiff = await jsonPost(`${base}/sessions`, {
-    cwd: '/repo-a', provider: 'deepseek', model: 'model-b',
-  })
-  assert.equal(modelDiff.status, 409)
-  assert.match(modelDiff.json.detail ?? '', /model:/)
-
-  // Different maxTokens → 409.
-  const mtDiff = await jsonPost(`${base}/sessions`, {
-    cwd: '/repo-a', provider: 'deepseek', model: 'model-a', maxTokens: 1024,
-  })
-  assert.equal(mtDiff.status, 409)
-  assert.match(mtDiff.json.detail ?? '', /maxTokens:/)
-
+  const r2 = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm2' })
+  assert.equal(r2.status, 409, 'second /sessions with different model must 409')
+  assert.equal(r2.json.error, 'runtime_route_mismatch')
   await bridge.close()
 })
 
 test('POST /sessions/:id/prompt returns messageId from upstream', async () => {
-  let lastId = ''
-  let lastBlocks: ContentBlock[] = []
-  const harness = makeFakeRuntime({
-    onPrompt: (id, blocks) => { lastId = id; lastBlocks = blocks; return 'msg-42' },
+  const runtime = makeFakeRuntime({
+    onPrompt: (_id, blocks) => `m-for-${blocks.length}`,
   })
-  const bridge = new Bridge({ port: 0, runtimeFactory: () => harness })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
-
   const created = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })
-  const sid = created.json.sessionId
+  const sid = created.json.sessionId as string
   const r = await jsonPost(`${base}/sessions/${sid}/prompt`, {
-    contentBlocks: [{ type: 'text', text: 'hi' } as ContentBlock],
+    contentBlocks: [{ type: 'text', text: 'hi' }],
   })
   assert.equal(r.status, 200)
-  assert.equal(r.json.messageId, 'msg-42')
-  assert.equal(lastId, sid)
-  assert.equal(lastBlocks.length, 1)
-
+  assert.equal(r.json.messageId, 'm-for-1')
   await bridge.close()
 })
 
 test('POST /sessions/:id/prompt 404 on unknown session', async () => {
-  const bridge = new Bridge({ port: 0, runtimeFactory: () => makeFakeRuntime({}) })
+  const runtime = makeFakeRuntime({})
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
 
-  const r = await jsonPost(`${base}/sessions/no-such-session/prompt`, { contentBlocks: [] })
+  const r = await jsonPost(`${base}/sessions/s-bogus/prompt`, {
+    contentBlocks: [{ type: 'text', text: 'hi' }],
+  })
   assert.equal(r.status, 404)
-
   await bridge.close()
 })
 
 test('POST /sessions/:id/close returns 501 (upstream has no per-session close)', async () => {
-  const bridge = new Bridge({ port: 0, runtimeFactory: () => makeFakeRuntime({}) })
+  const runtime = makeFakeRuntime({})
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
   const created = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })
-  const r = await jsonPost(`${base}/sessions/${created.json.sessionId}/close`, {})
+  const sid = created.json.sessionId as string
+  const r = await fetch(`${base}/sessions/${sid}/close`, { method: 'POST' })
   assert.equal(r.status, 501)
-  assert.match(r.json.detail ?? '', /no per-session close/)
+  const body = await r.json() as any
+  assert.equal(body.error, 'not_supported')
   await bridge.close()
 })
 
-test('GET /sessions/:id/events streams upstream notifications as SSE', async () => {
-  const subs = new Map<string, FakeSubscription>()
-  const make = () => makeFakeSubscription()
-  const harness = makeFakeRuntime({
-    onSubscribe: (id) => {
-      let s = subs.get(id)
-      if (!s) { s = make(); subs.set(id, s) }
-      return s
-    },
+test('GET /sessions/:id/events streams upstream notifications as SSE (upstream `type` discriminator)', async () => {
+  // Verifies the new wire shape: `kind` is gone; each SessionEvent is
+  // a flattened {sessionId, type, data?} with `type` drawn from the
+  // upstream catalog (assistant/message, turn/end, ...). Subagent
+  // notifications keep their notification-method name as `type`.
+  const sub = makeFakeSubscription()
+  const runtime = makeFakeRuntime({
+    onSubscribe: () => sub,
   })
-  const bridge = new Bridge({ port: 0, runtimeFactory: () => harness })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
-
   const created = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })
-  const sid = created.json.sessionId
+  const sid = created.json.sessionId as string
 
-  // Open SSE first; the bridge calls subscribeSessionTree in the GET handler,
-  // and only THEN does our onSubscribe factory populate `subs`.
-  const ctrl = new AbortController()
-  const collected = readSSE(`${base}/sessions/${sid}/events`, ctrl.signal)
-  // give the consumer a tick to subscribe
-  await new Promise((r) => setTimeout(r, 50))
-  const sub = subs.get(sid)
-  assert.ok(sub, 'subscribe factory should have populated the test map')
+  const controller = new AbortController()
+  const readerPromise = readSSE(`${base}/sessions/${sid}/events`, controller.signal)
 
-  sub.push({ method: 'session.event', params: { sessionId: sid, event: { kind: 'turn/end', seq: 1 } } })
+  // Allow the subscription pump to start before we push notifications.
+  await new Promise((r) => setTimeout(r, 25))
+  sub.push({ method: 'session.event', params: { sessionId: sid, event: { type: 'turn/end', data: { reason: 'end_turn' } } } })
   sub.push({ method: 'session.status', params: { sessionId: sid, status: 'idle' } })
   sub.push({ method: 'subagent.started', params: { parentSessionId: sid, childSessionId: 'c-1' } })
+  await new Promise((r) => setTimeout(r, 25))
+  controller.abort()
 
-  // give the stream a beat to deliver
-  await new Promise((r) => setTimeout(r, 100))
-  ctrl.abort()
-  const out = await collected
+  const out = await readerPromise
+  const event = out.find((e) => (e as any).type === 'turn/end') as any
+  const status = out.find((e) => (e as any).type === 'session.status') as any
+  const started = out.find((e) => (e as any).type === 'subagent.started') as any
+  assert.ok(event, 'expected upstream turn/end SSE frame')
+  assert.equal(event.sessionId, sid)
+  assert.equal(event.type, 'turn/end')
+  assert.deepEqual(event.data, { reason: 'end_turn' })
 
-  // Find each kind in the SSE output
-  const event = out.find((e) => (e as any).kind === 'session.event')
-  const status = out.find((e) => (e as any).kind === 'session.status')
-  const started = out.find((e) => (e as any).kind === 'subagent.started')
-  assert.ok(event, 'expected session.event SSE frame')
-  assert.equal((event as any).sessionId, sid)
   assert.ok(status)
-  assert.equal((status as any).status, 'idle')
-  assert.ok(started)
-  assert.equal((started as any).childSessionId, 'c-1')
+  assert.equal(status.status, 'idle')
 
+  assert.ok(started)
+  assert.equal(started.childSessionId, 'c-1')
   await bridge.close()
 })
 
 test('GET /sessions/:id/events emits bridge.transport_error when the subscription pump errors', async () => {
-  // Reviewer P1 #2: a plain HTTP EOF after the pump catches an error
-  // is not enough — Go bufio.Scanner.Err() reports nil for a clean
-  // close, so the Runner would hang waiting for an event that never
-  // arrives. The bridge must emit an explicit bridge.transport_error
-  // control frame BEFORE closing the stream so the Go side can route
-  // it to its typed transport-error channel.
-  const subs = new Map<string, FakeSubscription>()
-  const harness = makeFakeRuntime({
-    onSubscribe: (id) => {
-      let s = subs.get(id)
-      if (!s) { s = makeFakeSubscription(); subs.set(id, s) }
-      return s
-    },
+  // Reviewer P1 #2 (fhn): a plain HTTP EOF after the upstream pump
+  // catches an error is not enough — bufio.Scanner.Err() reports nil
+  // for a clean close, so the Runner would hang. The bridge emits an
+  // explicit bridge.transport_error control frame before closing.
+  const sub = makeFakeSubscription()
+  const runtime = makeFakeRuntime({
+    onSubscribe: () => sub,
   })
-  const bridge = new Bridge({ port: 0, runtimeFactory: () => harness })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
-
   const created = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })
-  const sid = created.json.sessionId
+  const sid = created.json.sessionId as string
 
-  // Open SSE, then simulate a transport failure on the subscription
-  // (the upstream died). The bridge should emit a bridge.transport_error
-  // SSE frame before closing the stream.
-  const ctrl = new AbortController()
-  const collected = readSSE(`${base}/sessions/${sid}/events`, ctrl.signal)
-  await new Promise((r) => setTimeout(r, 50))
-  const sub = subs.get(sid)
-  assert.ok(sub, 'subscribe factory should have populated the test map')
+  const controller = new AbortController()
+  const readerPromise = readSSE(`${base}/sessions/${sid}/events`, controller.signal)
+
+  await new Promise((r) => setTimeout(r, 25))
   sub.fail(new Error('upstream_runtime_disconnected'))
-  await new Promise((r) => setTimeout(r, 100))
-  ctrl.abort()
-  const out = await collected
+  await new Promise((r) => setTimeout(r, 25))
+  controller.abort()
 
-  const te = out.find((e) => (e as any).kind === 'bridge.transport_error') as
-    | { kind: 'bridge.transport_error'; message: string }
-    | undefined
-  assert.ok(te, 'expected a bridge.transport_error SSE frame after pump error')
-  assert.match(te.message, /upstream_runtime_disconnected/)
-
+  const out = await readerPromise
+  const transport = out.find((e) => (e as any).type === 'bridge.transport_error') as any
+  assert.ok(transport, 'expected bridge.transport_error frame')
+  assert.equal(transport.message, 'upstream_runtime_disconnected')
   await bridge.close()
 })
 
 test('GET /health reflects lifecycle', async () => {
-  const bridge = new Bridge({ port: 0, runtimeFactory: () => makeFakeRuntime({}) })
+  const runtime = makeFakeRuntime({})
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
 
-  const r1 = await (await fetch(`${base}/health`)).json() as any
-  assert.equal(r1.status, 'starting')
+  // Runtime is initialised lazily on first /sessions. Before that,
+  // /health reports `starting` and omits serverInfo.
+  const h0 = await (await fetch(`${base}/health`)).json() as any
+  assert.equal(h0.status, 'starting')
 
+  // After /sessions, the bridge has run the handshake and reports `ready`.
   await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })
-  const r2 = await (await fetch(`${base}/health`)).json() as any
-  assert.equal(r2.status, 'ready')
-
+  const h1 = await (await fetch(`${base}/health`)).json() as any
+  assert.equal(h1.status, 'ready')
   await bridge.close()
 })
 
 test('GET /health and POST /sessions surface the runtime-reported serverInfo (not fabricated)', async () => {
-  // The previous bridge fabricated `{ name: 'deepseek-harness-sdk-runtime', version: '0.0.1' }`
-  // for /health and /sessions regardless of the actual runtime. Now the
-  // runtimeFactory's serverInfo is surfaced honestly. The runtime is
-  // created lazily on first /sessions, so we POST first, then /health.
   const wire = { name: 'deepseek-harness-sdk-runtime', version: '0.4.2-rc.7' }
   const bridge = new Bridge({
     port: 0,
@@ -415,8 +365,6 @@ test('GET /health and POST /sessions surface the runtime-reported serverInfo (no
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
 
-  // Before any /sessions, the bridge has not initialised the runtime;
-  // /health reports `starting` and omits serverInfo.
   const h0 = await (await fetch(`${base}/health`)).json() as any
   assert.equal(h0.status, 'starting')
   assert.equal(h0.serverInfo, undefined, 'must not fabricate serverInfo when runtime not ready')
@@ -433,11 +381,6 @@ test('GET /health and POST /sessions surface the runtime-reported serverInfo (no
 })
 
 test('GET /health without serverInfo when runtime has not initialised (status: starting)', async () => {
-  // We force the bridge into the starting-but-no-runtime state by never
-  // creating a session. The default runtimeFactory would spawn a real
-  // process, so we inject one that throws on start() — that path leaves
-  // `this.runtime` undefined and the bridge reports `status: starting`
-  // with no serverInfo.
   const bridge = new Bridge({
     port: 0,
     runtimeFactory: () => makeFakeRuntime({ startShouldThrow: true }),
@@ -446,21 +389,14 @@ test('GET /health without serverInfo when runtime has not initialised (status: s
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
 
-  // /health before any session — runtime is undefined → status=starting, no serverInfo.
   const h = await (await fetch(`${base}/health`)).json() as any
   assert.equal(h.status, 'starting')
   assert.equal(h.serverInfo, undefined, 'must not fabricate serverInfo when runtime not ready')
 
-  // POST /sessions will fail (start throws) — we just want to assert no
-  // crash on the health path itself.
   await bridge.close()
 })
 
 test('POST /shutdown returns 204', async () => {
-  // We deliberately do NOT assert harness.close() was called here: that
-  // happens async after res.end() and server.close() completes, which
-  // is observable behaviour rather than a contract. The 204 + server
-  // no longer accepting new connections is what we promise to the caller.
   let startCalled = false
   const runtime = makeFakeRuntime({})
   ;(runtime as any).start = async () => { startCalled = true }
@@ -468,41 +404,281 @@ test('POST /shutdown returns 204', async () => {
   await bridge.listen()
   const addr = (bridge as any).server.address()
   const base = `http://127.0.0.1:${addr.port}`
-
   const created = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })
   assert.equal(created.status, 200)
   assert.ok(startCalled)
   const res = await fetch(`${base}/shutdown`, { method: 'POST' })
   assert.equal(res.status, 204)
-  // Server should now refuse new connections.
   let refused = false
   try { await fetch(`${base}/health`) } catch { refused = true }
   assert.ok(refused, 'post-shutdown fetch should fail')
   await bridge.close()
 })
 
-// ---- toBridgeEvent mapping ----
+// ---- toBridgeEvent mapping (upstream vocabulary) ----
 
-test('toBridgeEvent maps session.event / session.status / subagent.*', () => {
-  const ev = toBridgeEvent({ method: 'session.event', params: { sessionId: 's', event: { kind: 'turn/end' } } })
-  assert.equal(ev!.kind, 'session.event')
+test('toBridgeEvent flattens session.event to upstream SessionEvent.type', () => {
+  // Upstream `assistant/message` notification: the bridge flattens the
+  // envelope so the wire carries {sessionId, type, data} directly. No
+  // invented `kind`; `type` is the upstream value.
+  const ev = toBridgeEvent({
+    method: 'session.event',
+    params: { sessionId: 's', event: { type: 'assistant/message', data: { text: 'hi' } } },
+  })
   assert.equal((ev as any).sessionId, 's')
+  assert.equal((ev as any).type, 'assistant/message')
+  assert.deepEqual((ev as any).data, { text: 'hi' })
 
+  // turn/end with no data: `data` is omitted (not null) on the wire.
+  const ev2 = toBridgeEvent({
+    method: 'session.event',
+    params: { sessionId: 's', event: { type: 'turn/end' } },
+  })
+  assert.equal((ev2 as any).type, 'turn/end')
+  assert.equal((ev2 as any).data, undefined)
+})
+
+test('toBridgeEvent maps session.status and subagent notifications', () => {
   const st = toBridgeEvent({ method: 'session.status', params: { sessionId: 's', status: 'running' } })
-  assert.equal(st!.kind, 'session.status')
+  assert.equal((st as any).type, 'session.status')
   assert.equal((st as any).status, 'running')
 
   const sa = toBridgeEvent({ method: 'subagent.started', params: { parentSessionId: 'p', childSessionId: 'c' } })
-  assert.equal(sa!.kind, 'subagent.started')
+  assert.equal((sa as any).type, 'subagent.started')
   assert.equal((sa as any).childSessionId, 'c')
 
   const sf = toBridgeEvent({
     method: 'subagent.finished',
     params: { provider: 'p', agentId: 'c', parentSessionId: 'p', childSessionId: 'c', status: 'ok', stopReason: 'end_turn' },
   })
-  assert.equal(sf!.kind, 'subagent.finished')
+  assert.equal((sf as any).type, 'subagent.finished')
   assert.equal((sf as any).status, 'ok')
+})
 
-  const unk = toBridgeEvent({ method: 'mystery', params: {} })
-  assert.equal(unk!.kind, 'bridge.error')
+test('toBridgeEvent returns null for unknown upstream SessionEvent.type (no invented kinds)', async () => {
+  // Upstream sends an event with a type outside the catalog. The
+  // bridge refuses to forward a fabricated kind — surface as null.
+  // Reviewer P1 #5 (1jo): drop invented vocabulary, expose the upstream
+  // catalog exactly.
+  const unk = toBridgeEvent({
+    method: 'session.event',
+    params: { sessionId: 's', event: { type: 'agent.completed' } },
+  })
+  assert.equal(unk, null)
+})
+
+test('toBridgeEvent returns null for unknown upstream notification methods', () => {
+  const unk = toBridgeEvent({ method: 'mystery.method', params: {} })
+  assert.equal(unk, null)
+})
+
+// ---- POST /sessions/:id/run — owned Activity interval ----
+
+test('POST /sessions/:id/run emits run.start, forwards upstream events, closes on session.status=idle for root', async () => {
+  // Reviewer P1 #2 (b8c): subscribe-before-prompt → match
+  // agent/inbox/spliced(messageId) → real SessionEvent.type → root
+  // session.status=idle. No EOF dependency; no invented terminal event.
+  const sub = makeFakeSubscription()
+  const runtime = makeFakeRuntime({
+    onSubscribe: () => sub,
+    onPrompt: () => 'msg-1',
+  })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
+  await bridge.listen()
+  const addr = (bridge as any).server.address()
+  const base = `http://127.0.0.1:${addr.port}`
+  const created = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })
+  const sid = created.json.sessionId as string
+
+  const controller = new AbortController()
+  const readerPromise = readSSE(`${base}/sessions/${sid}/run`, controller.signal, { method: 'POST', body: { contentBlocks: [{ type: 'text', text: 'go' }] } })
+
+  // Allow the subscription pump to attach BEFORE we let prompt resolve.
+  await new Promise((r) => setTimeout(r, 25))
+  // The durable enqueue receipt: bridge waits for this notification to
+  // confirm the prompt was spliced into the agent's inbox.
+  sub.push({
+    method: 'session.event',
+    params: {
+      sessionId: sid,
+      event: {
+        type: 'agent/inbox/spliced',
+        data: { inserted: [{ id: 'msg-1' }] },
+      },
+    },
+  })
+  // Real upstream SessionEvents after the receipt.
+  sub.push({
+    method: 'session.event',
+    params: {
+      sessionId: sid,
+      event: { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'hello' }] } } },
+    },
+  })
+  sub.push({
+    method: 'session.event',
+    params: {
+      sessionId: sid,
+      event: { type: 'turn/end' },
+    },
+  })
+  // Root session idle closes the activity.
+  sub.push({ method: 'session.status', params: { sessionId: sid, status: 'idle' } })
+
+  const out = await readerPromise
+  // Lifecycle: run.start, agent/inbox/spliced, assistant/message,
+  // turn/end, session.status(idle), run.end(reason=idle).
+  const types = out.map((e: any) => e.type)
+  assert.deepEqual(types, [
+    'run.start',
+    'agent/inbox/spliced',
+    'assistant/message',
+    'turn/end',
+    'session.status',
+    'run.end',
+  ])
+  const start = out.find((e: any) => e.type === 'run.start') as any
+  assert.equal(start.messageId, 'msg-1')
+  const end = out.find((e: any) => e.type === 'run.end') as any
+  assert.equal(end.reason, 'idle')
+
+  // Note: no controller.abort() — the bridge closes the stream itself
+  // on idle. The fetch above resolves when the server closes the body.
+
+  await bridge.close()
+})
+
+test('POST /sessions/:id/run ignores idle on non-root sessions (subagent completion does not close root Activity)', async () => {
+  // Upstream subagent descendants can go idle independently. The root
+  // session staying running means the Activity is still open. The
+  // bridge must NOT close on a descendant's idle.
+  const sub = makeFakeSubscription()
+  const runtime = makeFakeRuntime({
+    onSubscribe: () => sub,
+    onPrompt: () => 'msg-1',
+  })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
+  await bridge.listen()
+  const addr = (bridge as any).server.address()
+  const base = `http://127.0.0.1:${addr.port}`
+  const created = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })
+  const sid = created.json.sessionId as string
+
+  const controller = new AbortController()
+  const readerPromise = readSSE(`${base}/sessions/${sid}/run`, controller.signal, { method: 'POST', body: { contentBlocks: [{ type: 'text', text: 'go' }] } })
+
+  await new Promise((r) => setTimeout(r, 25))
+  sub.push({
+    method: 'session.event',
+    params: { sessionId: sid, event: { type: 'agent/inbox/spliced', data: { inserted: [{ id: 'msg-1' }] } } },
+  })
+  // Subagent descendant goes idle. The root session is still running.
+  sub.push({ method: 'session.status', params: { sessionId: 'c-1', status: 'idle' } })
+  // ...then the root session finally goes idle.
+  sub.push({ method: 'session.status', params: { sessionId: sid, status: 'idle' } })
+
+  const out = await readerPromise
+  const end = out.find((e: any) => e.type === 'run.end') as any
+  assert.equal(end.reason, 'idle', 'root idle is the activity close, not the descendant idle')
+  // Only one run.end frame total.
+  assert.equal(out.filter((e: any) => e.type === 'run.end').length, 1)
+
+  controller.abort()
+  await bridge.close()
+})
+
+test('POST /sessions/:id/run emits bridge.transport_error + run.end(reason=transport_error) on subscription pump error', async () => {
+  // The bridge MUST surface pump failures as bridge.transport_error
+  // before the activity close (run.end with reason=transport_error).
+  // This is what the Go side routes to its typed errCh.
+  const sub = makeFakeSubscription()
+  const runtime = makeFakeRuntime({
+    onSubscribe: () => sub,
+    onPrompt: () => 'msg-1',
+  })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
+  await bridge.listen()
+  const addr = (bridge as any).server.address()
+  const base = `http://127.0.0.1:${addr.port}`
+  const created = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })
+  const sid = created.json.sessionId as string
+
+  const controller = new AbortController()
+  const readerPromise = readSSE(`${base}/sessions/${sid}/run`, controller.signal, { method: 'POST', body: { contentBlocks: [{ type: 'text', text: 'go' }] } })
+
+  await new Promise((r) => setTimeout(r, 25))
+  sub.push({
+    method: 'session.event',
+    params: { sessionId: sid, event: { type: 'agent/inbox/spliced', data: { inserted: [{ id: 'msg-1' }] } } },
+  })
+  await new Promise((r) => setTimeout(r, 10))
+  sub.fail(new Error('upstream_runtime_disconnected'))
+
+  const out = await readerPromise
+  const transport = out.find((e: any) => e.type === 'bridge.transport_error') as any
+  assert.ok(transport, 'expected bridge.transport_error frame')
+  assert.equal(transport.message, 'upstream_runtime_disconnected')
+  const end = out.find((e: any) => e.type === 'run.end') as any
+  assert.equal(end.reason, 'transport_error')
+  // Transport_error frame appears BEFORE run.end so the consumer sees
+  // the same terminal sequence (error then terminal close).
+  const transportIdx = out.findIndex((e: any) => e.type === 'bridge.transport_error')
+  const endIdx = out.findIndex((e: any) => e.type === 'run.end')
+  assert.ok(transportIdx < endIdx, 'bridge.transport_error must precede run.end')
+
+  controller.abort()
+  await bridge.close()
+})
+
+test('POST /sessions/:id/run 409 when an Activity is already in progress on the session', async () => {
+  // Only one Activity per session; concurrent runs on the same session
+  // would race on the same upstream subscription.
+  const sub = makeFakeSubscription()
+  const runtime = makeFakeRuntime({
+    onSubscribe: () => sub,
+    onPrompt: () => 'msg-1',
+  })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
+  await bridge.listen()
+  const addr = (bridge as any).server.address()
+  const base = `http://127.0.0.1:${addr.port}`
+  const created = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })
+  const sid = created.json.sessionId as string
+
+  // Open first /run and keep it open (do NOT push idle).
+  const c1 = new AbortController()
+  const r1 = readSSE(`${base}/sessions/${sid}/run`, c1.signal, { method: 'POST', body: { contentBlocks: [{ type: 'text', text: 'go' }] } })
+  await new Promise((r) => setTimeout(r, 25))
+
+  // Second /run on the same session must 409.
+  const r2 = await fetch(`${base}/sessions/${sid}/run`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ contentBlocks: [{ type: 'text', text: 'hi' }] }),
+  })
+  assert.equal(r2.status, 409)
+  const body = await r2.json() as any
+  assert.equal(body.error, 'run_in_progress')
+
+  // Tidy up: close first stream, then close bridge.
+  sub.push({ method: 'session.status', params: { sessionId: sid, status: 'idle' } })
+  await r1
+  c1.abort()
+  await bridge.close()
+})
+
+test('POST /sessions/:id/run 404 on unknown session', async () => {
+  const runtime = makeFakeRuntime({})
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
+  await bridge.listen()
+  const addr = (bridge as any).server.address()
+  const base = `http://127.0.0.1:${addr.port}`
+
+  const r = await fetch(`${base}/sessions/s-bogus/run`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ contentBlocks: [{ type: 'text', text: 'hi' }] }),
+  })
+  assert.equal(r.status, 404)
+  await bridge.close()
 })

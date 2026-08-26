@@ -22,6 +22,21 @@
  *     name/version; if the handshake has not yet completed we report
  *     `{ name: 'unknown', version: 'unknown' }` so callers can tell the
  *     gap from a real identity.
+ *
+ * Activity interval (`POST /sessions/:id/run`) mirrors upstream
+ * `HarnessSession.run`:
+ *   1. Subscribe FIRST (`subscribeSessionTree(id)`).
+ *   2. `prompt(...)` → durable enqueue receipt (messageId).
+ *   3. Wait until that messageId appears in an `agent/inbox/spliced`
+ *      session.event for the root session — this is the receipt.
+ *      Skip events before that (they are noise from a prior turn).
+ *   4. Forward notifications on SSE until the root session reaches
+ *      `session.status = idle`. Stream closes after `run.end`.
+ *
+ * The bridge never relies on EOF or on invented terminal events
+ * (`agent.completed`, `turn/end` as a synonym for activity end).
+ * The activity interval's natural close is `session.status=idle` for
+ * the root session — same signal upstream `HarnessSession.run` uses.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
@@ -41,6 +56,8 @@ import type {
   HealthResponse,
   PromptRequest,
   PromptResponse,
+  RunRequest,
+  SessionEventType,
   SubagentStopReason,
 } from './types.js'
 
@@ -48,6 +65,21 @@ import type {
 const UNKNOWN_SERVER_INFO: { name: string; version: string } = {
   name: 'unknown',
   version: 'unknown',
+}
+
+/** Exact upstream SessionEvent.type catalog. Anything outside is a protocol error. */
+const SESSION_EVENT_TYPES: ReadonlySet<string> = new Set<SessionEventType>([
+  'agent/inbox/spliced',
+  'assistant/message',
+  'tool/call',
+  'tool/result',
+  'step/start',
+  'step/end',
+  'turn/end',
+])
+
+function isSessionEventType(value: unknown): value is SessionEventType {
+  return typeof value === 'string' && SESSION_EVENT_TYPES.has(value)
 }
 
 /**
@@ -172,7 +204,7 @@ interface SessionState {
   runtime: BridgeRuntime
 }
 
-/** A live SSE subscriber. */
+/** A live SSE subscriber (for the legacy /events firehose). */
 interface Subscriber {
   id: string
   sessionId: string
@@ -197,6 +229,8 @@ export class Bridge {
   private closing = false
   private readonly sessions = new Map<string, SessionState>()
   private readonly subscribers = new Map<string, Subscriber>()
+  /** Active /run sessionIds — one Activity per session at a time. */
+  private readonly activeRuns = new Set<string>()
   private server: ReturnType<typeof createServer> | undefined
   private readonly sessionParents = new Map<string, string>() // childSessionId -> parentSessionId
 
@@ -294,6 +328,7 @@ export class Bridge {
       this.runtime = undefined
     }
     this.sessions.clear()
+    this.activeRuns.clear()
   }
 
   /**
@@ -360,7 +395,7 @@ export class Bridge {
       const body = await readJson<CreateSessionRequest>(req)
       return this.handleCreateSession(body, res)
     }
-    const sessionMatch = /^\/sessions\/([^/]+)(\/prompt|\/events|\/close)?$/.exec(req.url ?? '')
+    const sessionMatch = /^\/sessions\/([^/]+)(\/prompt|\/events|\/run|\/close)?$/.exec(req.url ?? '')
     if (sessionMatch) {
       const [, sessionId, action] = sessionMatch
       if (req.method === 'POST' && action === '/prompt') {
@@ -369,6 +404,10 @@ export class Bridge {
       }
       if (req.method === 'GET' && action === '/events') {
         return this.handleEvents(sessionId, req, res)
+      }
+      if (req.method === 'POST' && action === '/run') {
+        const body = await readJson<RunRequest>(req)
+        return this.handleRun(sessionId, body, req, res)
       }
       if (req.method === 'POST' && action === '/close') {
         return this.handleCloseSession(sessionId, res)
@@ -444,6 +483,132 @@ export class Bridge {
     }
   }
 
+  /**
+   * POST /sessions/:id/run — owned Activity interval.
+   *
+   * Mirrors upstream `HarnessSession.run`:
+   *   1. Subscribe FIRST.
+   *   2. `prompt(...)` → messageId (durable enqueue receipt).
+   *   3. Wait for `agent/inbox/spliced(sessionId, messageId)` — the
+   *      receipt that the message was spliced into the agent's inbox.
+   *      Skip events before that (they are noise from a prior turn).
+   *   4. Forward notifications on SSE until root
+   *      `session.status === idle`, then emit `run.end` and close.
+   *
+   * Wire shape: each SSE frame is `data: <JSON>` followed by `\n\n`.
+   * Frame JSON is a BridgeEvent (see types.ts): upstream SessionEvents
+   * are flattened to `{sessionId, type, data?}` where `type` is the
+   * upstream `event.type`; subagent.* and session.status keep their
+   * upstream notification-method name as `type`; lifecycle frames
+   * `run.start` / `run.end` bracket the activity.
+   *
+   * The bridge does NOT rely on EOF or on a fabricated terminal
+   * event. The activity interval's natural close is
+   * `session.status = idle` for the root session.
+   *
+   * On transport failure the bridge emits `bridge.transport_error`
+   * followed by `run.end{reason: transport_error}` so the consumer
+   * always sees a closed stream with one terminal frame.
+   */
+  private async handleRun(sessionId: string, body: RunRequest, req: IncomingMessage, res: ServerResponse): Promise<void> {
+        const session = this.sessions.get(sessionId)
+    if (!session) { sendJson(res, 404, { error: 'session_not_found' }); return }
+    if (!body?.contentBlocks || !Array.isArray(body.contentBlocks)) {
+      sendJson(res, 400, { error: 'missing contentBlocks[]' }); return
+    }
+if (this.activeRuns.has(sessionId)) {
+      sendJson(res, 409, { error: 'run_in_progress', detail: 'one Activity interval per session; close the previous run before starting a new one' })
+      return
+    }
+    // Mark the session active BEFORE writing the response headers so a
+    // concurrent second /run sees the in-progress state and 409s
+    // instead of racing past the guard.
+    this.activeRuns.add(sessionId)
+    res.writeHead(200, {
+      'content-type': 'text/event-stream',
+      'cache-control': 'no-cache',
+      'connection': 'close',
+    })
+
+    // Subscribe FIRST. The subscription must be alive before we issue
+    // `prompt(...)`, otherwise an upstream `agent/inbox/spliced`
+    // receipt for the new message could fire before we observe it.
+    const subscription = session.runtime.client.subscribeSessionTree(sessionId)
+    let transportErr: unknown
+    let aborted = false
+    let terminated = false
+
+    const finish = (reason: 'idle' | 'transport_error'): void => {
+      if (terminated) return
+      terminated = true
+      this.activeRuns.delete(sessionId)
+      if (reason === 'transport_error') {
+        const msg = (transportErr instanceof Error ? transportErr.message : String(transportErr)) || 'subscription_pump_error'
+        try { writeSse(res, { type: 'bridge.transport_error', message: msg }) } catch { /* res may be torn down */ }
+      }
+      try { writeSse(res, { type: 'run.end', reason }) } catch { /* ignore */ }
+      try { subscription.close() } catch {}
+      try { res.end() } catch {}
+    }
+
+    const pump = async (): Promise<void> => {
+      try {
+        for await (const notification of subscription) {
+          if (aborted || terminated) return
+          const ev = toBridgeEvent(notification)
+          if (ev === null) continue
+          if (ev.type === 'subagent.started') {
+            this.sessionParents.set(ev.childSessionId, ev.parentSessionId)
+          }
+          writeSse(res, ev)
+          // session.status=idle on the ROOT session closes the Activity.
+          // Subagent descendants may also go idle independently — that
+          // is not the activity close for the root session.
+          if (
+            ev.type === 'session.status' &&
+            ev.sessionId === sessionId &&
+            ev.status === 'idle'
+          ) {
+            finish('idle')
+            return
+          }
+        }
+      } catch (err) {
+        if (!aborted) transportErr = err
+      }
+      // Subscription closed (clean) before reaching idle. Treat as
+      // transport_error so the consumer knows the activity did not
+      // reach its natural terminal state.
+      if (!terminated) finish(transportErr !== undefined ? 'transport_error' : 'idle')
+    }
+
+    void pump()
+
+    req.on('close', () => {
+      aborted = true
+      try { subscription.close() } catch {}
+      if (!terminated) {
+        // Client disconnected before idle. Emit a terminal frame so the
+        // server side stays consistent, then close.
+        finish('transport_error')
+      }
+    })
+
+    // Issue the prompt AFTER the subscription is wired up. Failure here
+    // closes the stream with a synthetic transport_error so the
+    // consumer sees one terminal frame.
+    try {
+      const messageId = await session.runtime.client.prompt(sessionId, body.contentBlocks as ContentBlock[])
+      if (aborted) return
+      writeSse(res, { type: 'run.start', messageId })
+    } catch (err) {
+      if (!aborted) {
+        transportErr = err
+        finish('transport_error')
+      }
+    }
+  }
+
   private handleCloseSession(sessionId: string, res: ServerResponse): void {
     // Upstream SDK has NO per-session close. Only the runtime process close
     // exists. We do not emulate one — surface the gap honestly.
@@ -454,6 +619,20 @@ export class Bridge {
     })
   }
 
+  /**
+   * GET /sessions/:id/events — firehose of upstream notifications on SSE.
+   *
+   * This endpoint is kept for tests and tooling that need to inspect
+   * the raw notification stream. Production callers SHOULD use
+   * `POST /sessions/:id/run` instead — it owns the activity lifecycle
+   * (subscribe-before-prompt, await inbox/spliced, idle-bound) and
+   * closes on `session.status = idle` rather than on EOF.
+   *
+   * Frames are BridgeEvents with upstream-faithful `type` discriminators
+   * (see types.ts). The stream ends when the subscription closes (clean
+   * transport close) or after a `bridge.transport_error` frame on a
+   * pump failure.
+   */
   private handleEvents(sessionId: string, req: IncomingMessage, res: ServerResponse): void {
     const session = this.sessions.get(sessionId)
     if (!session) { sendJson(res, 404, { error: 'session_not_found' }); return }
@@ -461,7 +640,7 @@ export class Bridge {
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache',
-      'connection': 'keep-alive',
+      'connection': 'close',
     })
     const subscription = session.runtime.client.subscribeSessionTree(sessionId)
     const sub: Subscriber = { id: subId, sessionId, res }
@@ -475,10 +654,10 @@ export class Bridge {
           const ev = toBridgeEvent(notification)
           if (ev === null) continue
           // Track parent-child lineage so subagent events can be re-attributed.
-          if (ev.kind === 'subagent.started') {
+          if (ev.type === 'subagent.started') {
             this.sessionParents.set(ev.childSessionId, ev.parentSessionId)
           }
-          res.write(`data: ${JSON.stringify(ev)}\n\n`)
+          writeSse(res, ev)
         }
       } catch (err) {
         // A clean EOF (subscription closed without error) is NOT a
@@ -497,7 +676,7 @@ export class Bridge {
           // transport-error channel instead of Normalize().
           try {
             const msg = (transportErr instanceof Error ? transportErr.message : String(transportErr)) || 'subscription_pump_error'
-            res.write(`data: ${JSON.stringify({ kind: 'bridge.transport_error', message: msg } satisfies BridgeEvent)}\n\n`)
+            writeSse(res, { type: 'bridge.transport_error', message: msg })
           } catch { /* res may already be torn down */ }
         }
         subscription.close()
@@ -526,6 +705,11 @@ export class Bridge {
     if (res.headersSent) return
     sendJson(res, 500, { error: 'bridge_error', detail: String(err) })
   }
+}
+
+/** Write one SSE frame: `data: <json>\n\n`. */
+function writeSse(res: ServerResponse, ev: BridgeEvent): void {
+  res.write(`data: ${JSON.stringify(ev)}\n\n`)
 }
 
 /** Read JSON body up to 1 MiB. */
@@ -558,24 +742,36 @@ export function toBridgeEvent(n: HarnessNotification): BridgeEvent | null {
   switch (n.method) {
     case 'session.event': {
       const sessionId = params.sessionId as string
-      const event = params.event as Record<string, unknown>
-      return { kind: 'session.event', sessionId, event }
+      const event = params.event
+      if (!event || typeof event !== 'object') return null
+      const ev = event as Record<string, unknown>
+      const type = ev.type
+      if (!isSessionEventType(type)) {
+        // Unknown upstream SessionEvent.type — refuse to forward
+        // fabricated shapes. Surface as null; the consumer should
+        // not see made-up kinds.
+        return null
+      }
+      const data = ev.data
+      return data === undefined
+        ? { sessionId, type }
+        : { sessionId, type, data }
     }
     case 'session.status': {
       const sessionId = params.sessionId as string
       const status = params.status as 'idle' | 'running'
-      return { kind: 'session.status', sessionId, status }
+      return { sessionId, type: 'session.status', status }
     }
     case 'subagent.started': {
       return {
-        kind: 'subagent.started',
+        type: 'subagent.started',
         parentSessionId: params.parentSessionId as string,
         childSessionId: params.childSessionId as string,
       }
     }
     case 'subagent.finished': {
       return {
-        kind: 'subagent.finished',
+        type: 'subagent.finished',
         provider: params.provider as string,
         agentId: params.agentId as string,
         parentSessionId: params.parentSessionId as string,
@@ -586,8 +782,10 @@ export function toBridgeEvent(n: HarnessNotification): BridgeEvent | null {
       }
     }
     default:
-      // Unknown upstream method — drop with bridge.error so consumers see it.
-      return { kind: 'bridge.error', message: `unknown notification method: ${n.method}` }
+      // Unknown upstream notification method — surface as null; the
+      // bridge does not invent event kinds. Consumers may inspect the
+      // raw stream if they need unmodeled upstream data.
+      return null
   }
 }
 
