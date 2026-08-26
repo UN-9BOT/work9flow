@@ -51,42 +51,77 @@ const UNKNOWN_SERVER_INFO: { name: string; version: string } = {
 }
 
 /**
- * Pinned runtime version. MUST match the SDK pin in
- * runtime/dsh-bridge/package.json
- *   "@deepseek-ai/dsh-sdk-client":  "0.1.1-rc.2"
- *   "@deepseek-ai/dsh-sdk-protocol": "0.1.1-rc.2"
- * If upstream bumps, bump both this constant and the package.json
- * pins in lockstep.
+ * Expected runtime server identity, asserted at startup. This is the
+ * `serverInfo` value the upstream DSH runtime reports in its
+ * `initialize` handshake. It is the runtime's PROTOCOL identity, NOT
+ * the npm release pin of the SDK.
  *
- * Per user decision (reviewer P1 #3, 2026-08-25): fail HARD on any
- * drift. No patch-level leniency, no warning-only.
+ * Release provenance (sdkClient, sdkProtocol, upstreamCommit) lives in
+ * runtime/dsh-bridge/COMPATIBILITY.md and is enforced out-of-band by
+ * the build, not by initialize.
+ *
+ * If upstream bumps the protocol identity, bump this constant in
+ * lockstep with the upstream SDK release notes — do NOT use the npm
+ * version number here.
  */
-export const PINNED_RUNTIME_VERSION = '0.1.1-rc.2'
+export const EXPECTED_SERVER_INFO = {
+  name: 'deepseek-harness-sdk-runtime',
+  version: '0.0.1',
+} as const
 
 /**
- * Validate the runtime-reported serverInfo against the SDK pin.
- * Throws if the runtime version differs from the pinned version in
- * any way (including patch-level drift).
+ * Validate the runtime-reported serverInfo against
+ * EXPECTED_SERVER_INFO. Throws on:
+ *   - wrong server name
+ *   - wrong server protocol identity (version)
+ *   - missing/empty/malformed serverInfo fields
+ *
+ * Per user decision (reviewer P1 #3, 2026-08-25): fail HARD on any
+ * mismatch. No patch-level leniency, no warning-only.
  *
  * Callers should invoke this immediately after `client.initialize()`
  * returns, before the first /sessions request is served. The bridge
  * uses this in defaultRuntimeFactory; tests can call it directly.
  */
-export function validateRuntimeVersion(
+export function validateServerIdentity(
   serverInfo: { name: string; version: string },
 ): void {
-  if (serverInfo.version !== PINNED_RUNTIME_VERSION) {
+  if (!serverInfo || typeof serverInfo !== 'object') {
     throw new Error(
-      `bridge runtime version mismatch: pinned ${PINNED_RUNTIME_VERSION}, ` +
-      `runtime reports ${serverInfo.version} ` +
-      `(name=${serverInfo.name}). ` +
-      `Refusing to bridge against an SDK/runtime version drift. ` +
-      `Update PINNED_RUNTIME_VERSION in src/server.ts AND ` +
-      `@deepseek-ai/dsh-sdk-* pins in package.json in lockstep.`,
+      `bridge serverInfo missing or not an object: ${JSON.stringify(serverInfo)}. ` +
+      `Refusing to bridge against a runtime that did not complete the initialize handshake.`,
+    )
+  }
+  const { name, version } = serverInfo
+  if (typeof name !== 'string' || name === '') {
+    throw new Error(
+      `bridge serverInfo.name is missing or empty: ${JSON.stringify(serverInfo)}. ` +
+      `Refusing to bridge against a runtime without a stable identity.`,
+    )
+  }
+  if (typeof version !== 'string' || version === '') {
+    throw new Error(
+      `bridge serverInfo.version is missing or empty: ${JSON.stringify(serverInfo)}. ` +
+      `Refusing to bridge against a runtime without a stable protocol identity.`,
+    )
+  }
+  if (name !== EXPECTED_SERVER_INFO.name) {
+    throw new Error(
+      `bridge serverInfo.name mismatch: expected ${EXPECTED_SERVER_INFO.name}, ` +
+      `runtime reports ${name}. ` +
+      `Refusing to bridge against an unknown runtime.`,
+    )
+  }
+  if (version !== EXPECTED_SERVER_INFO.version) {
+    throw new Error(
+      `bridge serverInfo.version mismatch: expected ${EXPECTED_SERVER_INFO.version}, ` +
+      `runtime reports ${version}. ` +
+      `Refusing to bridge against an SDK/runtime protocol drift. ` +
+      `If upstream intentionally bumped the protocol identity, update ` +
+      `EXPECTED_SERVER_INFO in src/server.ts.`,
     )
   }
 }
-
 
 /**
  * The small surface the bridge actually drives. We use HarnessClient
@@ -225,7 +260,7 @@ export class Bridge {
         version: init.serverInfo.version,
       }
       // Fail-hard on SDK/runtime version drift (reviewer P1 #3).
-      validateRuntimeVersion(serverInfo)
+      validateServerIdentity(serverInfo)
     } catch (err) {
       // Tear down the (failed) client before propagating so we never
       // leak a child process.
