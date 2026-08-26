@@ -62,7 +62,7 @@ make test          # go test ./...
 make vet           # go vet ./...
 make tidy          # go mod tidy
 make smoke         # boot runtime + CRUD endpoints + TUI --once
-make smoke-full    # boot runtime/dsh-bridge + scripted provider, drive run → DONE
+# `make smoke-full` was REMOVED in bead work9flow-8w0 (dsh-A.10e) — see Статус below.
 make healthcheck   # non-interactive work9flow --once
 make run-runtime   # запустить work9flowd на 127.0.0.1:7469
 ```
@@ -122,7 +122,10 @@ export WORK9FLOW_DSH_BRIDGE_ADDR=http://127.0.0.1:7770
 
 MVP 01–07 закрыты (см. `bd list` / `git log --oneline`). CRUD-слой,
 state machine, DSH-адаптер, агенты (scout/planner/gatekeeper/implementer/reviewer),
-TUI, dsh-bridge зарегистрирован. Полный pipeline
-end-to-end проверяется через `make smoke-full` (run доходит до DONE через
-runtime/dsh-bridge + scripted OpenAI-провайдер). Реальный upstream-DSH запуск —
-`export MINIM_API_KEY=... && work9flowd --config=work9flow.yaml`.
+TUI, dsh-bridge зарегистрирован.
+
+**Full real-DSH E2E is NOT yet a passed gate.** `make smoke-full`
+был удалён вместе с production localdsh path (bead work9flow-8w0).
+Новый assembled real-DSH gate появится в bead `work9flow-7dh`
+после того, как будет собран `dsh-jsonrpc-agent` runtime и
+`runtime/dsh-bridge` начнёт им управлять end-to-end.

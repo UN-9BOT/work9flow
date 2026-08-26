@@ -15,12 +15,12 @@ runtime/dsh-bridge/
 ├── package.json      pinned @deepseek-ai/dsh-sdk-client 0.1.1-rc.2
 ├── tsconfig.json
 ├── src/
-│   ├── launcher.ts   spawn dsh-jsonrpc-agent (exe or dev node carrier)
+│   ├── launcher.ts   pure argv resolver for dsh-jsonrpc-agent (subprocess owned by HarnessClient)
 │   ├── server.ts     HTTP server + HarnessClient wrapper
 │   └── types.ts      wire types
 └── tests/
     ├── launcher.test.ts  pure launcher tests
-    └── server.test.ts    HTTP layer tests with a fake DeepSeekHarness
+    └── server.test.ts    HTTP layer tests with a fake runtimeFactory
 ```
 
 ## Wire protocol (bridge ↔ work9flow)

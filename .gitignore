@@ -27,3 +27,5 @@
 # Personal review-loop automation (see ~/.config/work9flow/skills/)
 .agents/skills/work9flow-review-loop/
 
+# JetBrains / IDE local state
+.idea/
