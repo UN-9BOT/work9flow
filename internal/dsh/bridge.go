@@ -405,6 +405,14 @@ func (b *Bridge) readSSERun(ctx context.Context, resp *http.Response, evCh chan<
 	sawTransportError := false
 	for scanner.Scan() {
 		if ctx.Err() != nil {
+			// Reviewer P1: ctx cancellation must surface as a real error
+			// on errCh — otherwise a stray assistant/message before
+			// cancel could leave Runner.Run reporting success without
+			// run.end{reason=idle}.
+			select {
+			case errCh <- fmt.Errorf("%w: %v", ErrRunIncomplete, ctx.Err()):
+			default:
+			}
 			return
 		}
 		line := scanner.Text()
@@ -473,11 +481,20 @@ func (b *Bridge) readSSERun(ctx context.Context, resp *http.Response, evCh chan<
 		// Stream closed without `run.end`. The Activity did NOT reach
 		// its natural terminal state — surface ErrRunIncomplete so the
 		// Runner reports the run as incomplete instead of fabricating
-		// success from a stray assistant/message.
-		if !sawTransportError && ctx.Err() == nil {
-			select {
-			case errCh <- ErrRunIncomplete:
-			default:
+		// success from a stray assistant/message. If ctx was cancelled
+		// wrap the context error so the caller can distinguish cancel
+		// from a generic transport close.
+		if !sawTransportError {
+			if ctx.Err() != nil {
+				select {
+				case errCh <- fmt.Errorf("%w: %v", ErrRunIncomplete, ctx.Err()):
+				default:
+				}
+			} else {
+				select {
+				case errCh <- ErrRunIncomplete:
+				default:
+				}
 			}
 		}
 	}
@@ -574,6 +591,14 @@ func (b *Bridge) readSSE(ctx context.Context, resp *http.Response, evCh chan<- N
 	var dataBuf bytes.Buffer
 	for scanner.Scan() {
 		if ctx.Err() != nil {
+			// Reviewer P1: ctx cancellation must surface as a real error
+			// on errCh — otherwise a stray assistant/message before
+			// cancel could leave Runner.Run reporting success without
+			// run.end{reason=idle}.
+			select {
+			case errCh <- fmt.Errorf("%w: %v", ErrRunIncomplete, ctx.Err()):
+			default:
+			}
 			return
 		}
 		line := scanner.Text()

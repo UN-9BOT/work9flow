@@ -577,17 +577,16 @@ if (this.activeRuns.has(sessionId)) {
           // Receipt correlation: until we observe agent/inbox/spliced
           // carrying the messageId from THIS prompt, any session.status
           // or other activity events belong to a prior turn and must NOT
-          // close this Activity. We buffer them silently — once the
-          // receipt arrives, we forward the buffer and then live events.
+          // close this Activity. The receipt buffer handles events
+          // before prompt() resolves; live events are dropped until the
+          // spliced receipt is observed.
           if (!splicedMessageId) {
             if (isSplicedReceipt(ev as { type: string; data?: unknown })) {
               splicedMessageId = messageId
               writeSse(res, ev)
-            } else {
-              // Drop prior-turn noise (events that arrived between
-              // subscribeSessionTree and the spliced receipt).
-              continue
             }
+            // else: drop prior-turn noise (events that arrived between
+            // subscribeSessionTree and the matching receipt).
           } else {
             writeSse(res, ev)
           }
