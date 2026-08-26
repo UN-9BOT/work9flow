@@ -581,19 +581,23 @@ if (this.activeRuns.has(sessionId)) {
           // before prompt() resolves; live events are dropped until the
           // spliced receipt is observed.
           if (!splicedMessageId) {
-            if (isSplicedReceipt(ev as { type: string; data?: unknown })) {
+            if (messageId !== undefined && isSplicedReceipt(ev as { type: string; data?: unknown })) {
               splicedMessageId = messageId
               writeSse(res, ev)
             }
-            // else: drop prior-turn noise (events that arrived between
-            // subscribeSessionTree and the matching receipt).
+            // else: drop prior-turn noise (events that arrived before
+            // the matching receipt, OR events whose receipt carries a
+            // different messageId — the bridge only correlates THIS
+            // prompt's receipt, never a foreign one).
           } else {
             writeSse(res, ev)
           }
           // session.status=idle on the ROOT session closes the Activity.
-          // Subagent descendants may also go idle independently — that
-          // is not the activity close for the root session.
+          // IMPORTANT: this check applies only to events that the
+          // receipt guard actually forwarded. Prior-turn idle that was
+          // dropped in the guard above MUST NOT close this Activity.
           if (
+            splicedMessageId &&
             ev.type === 'session.status' &&
             ev.sessionId === sessionId &&
             ev.status === 'idle'

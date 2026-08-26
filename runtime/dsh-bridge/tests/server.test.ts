@@ -677,12 +677,99 @@ test('POST /sessions/:id/run 409 when an Activity is already in progress on the 
   await bridge.close()
 })
 
-// NOTE: reviewer P1 #1 receipt-correlation guard is covered by
-// production code in handleRun; the assertion-driven test was
-// regressing under the race-safe pre-messageId buffer and is
-// temporarily disabled pending reviewer feedback. The remaining
-// tests cover the active happy-path scenarios; the receipt guard
-// is asserted via the integration story with work9flow-7dh.
+// Receipt-correlation guard. The pump must drop prior-turn session.status
+// frames and any receipts with a foreign messageId; the matching receipt
+// is the gate that opens live forwarding, after which root session.status=idle
+// closes the Activity. Each scenario uses its own bridge + subscription so
+// prior-run state cannot leak.
+test('POST /sessions/:id/run drops prior root idle until matching receipt arrives', async () => {
+  const sub = makeFakeSubscription()
+  const runtime = makeFakeRuntime({
+    onSubscribe: () => sub,
+    onPrompt: () => 'msg-1',
+  })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
+  await bridge.listen()
+  const base = `http://127.0.0.1:${(bridge as any).server.address().port}`
+  const sid = (await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })).json.sessionId
+
+  const ctl = new AbortController()
+  const reader = readSSE(`${base}/sessions/${sid}/run`, ctl.signal, { method: 'POST', body: { contentBlocks: [{ type: 'text', text: 'go' }] } })
+
+  // Let the pump start + prompt() resolve + run.start fire.
+  await new Promise(r => setTimeout(r, 25))
+  // Prior-turn root idle: must be dropped, the Activity must NOT close.
+  sub.push({ method: 'session.status', params: { sessionId: sid, status: 'idle' } })
+  await new Promise(r => setTimeout(r, 25))
+  // Receipt for THIS prompt: now forwarding opens.
+  sub.push({
+    method: 'session.event',
+    params: { sessionId: sid, event: { type: 'agent/inbox/spliced', data: { inserted: [{ id: 'msg-1' }] } } },
+  })
+  // Live assistant + root idle close the Activity.
+  sub.push({
+    method: 'session.event',
+    params: { sessionId: sid, event: { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'hi' }] } } } },
+  })
+  sub.push({ method: 'session.status', params: { sessionId: sid, status: 'idle' } })
+
+  const out = await reader
+  const types = out.map((e: any) => e.type)
+  assert.deepEqual(types, [
+    'run.start',
+    'agent/inbox/spliced',
+    'assistant/message',
+    'session.status',
+    'run.end',
+  ])
+  const end = out.find((e: any) => e.type === 'run.end') as any
+  assert.ok(end, 'run.end present')
+  assert.equal(end.reason, 'idle')
+  await bridge.close()
+})
+
+test('POST /sessions/:id/run ignores spliced receipts with a foreign messageId', async () => {
+  const sub = makeFakeSubscription()
+  const runtime = makeFakeRuntime({
+    onSubscribe: () => sub,
+    onPrompt: () => 'msg-real',
+  })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
+  await bridge.listen()
+  const base = `http://127.0.0.1:${(bridge as any).server.address().port}`
+  const sid = (await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })).json.sessionId
+
+  const ctl = new AbortController()
+  const reader = readSSE(`${base}/sessions/${sid}/run`, ctl.signal, { method: 'POST', body: { contentBlocks: [{ type: 'text', text: 'go' }] } })
+
+  await new Promise(r => setTimeout(r, 25))
+  // Foreign receipt: must be dropped, Activity stays open.
+  sub.push({
+    method: 'session.event',
+    params: { sessionId: sid, event: { type: 'agent/inbox/spliced', data: { inserted: [{ id: 'msg-other' }] } } },
+  })
+  await new Promise(r => setTimeout(r, 25))
+  // Matching receipt: opens forwarding.
+  sub.push({
+    method: 'session.event',
+    params: { sessionId: sid, event: { type: 'agent/inbox/spliced', data: { inserted: [{ id: 'msg-real' }] } } },
+  })
+  sub.push({
+    method: 'session.event',
+    params: { sessionId: sid, event: { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'hi' }] } } } },
+  })
+  sub.push({ method: 'session.status', params: { sessionId: sid, status: 'idle' } })
+
+  const out = await reader
+  const types = out.map((e: any) => e.type)
+  // Only one spliced frame (the matching one).
+  const splicedCount = types.filter(t => t === 'agent/inbox/spliced').length
+  assert.equal(splicedCount, 1, 'exactly one matching spliced should be forwarded')
+  assert.ok(types.includes('run.end'))
+  const end = out.find((e: any) => e.type === 'run.end') as any
+  assert.equal(end.reason, 'idle')
+  await bridge.close()
+})
 
 test('POST /sessions/:id/run 404 on unknown session', async () => {
   const runtime = makeFakeRuntime({})
