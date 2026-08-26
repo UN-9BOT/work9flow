@@ -51,6 +51,44 @@ const UNKNOWN_SERVER_INFO: { name: string; version: string } = {
 }
 
 /**
+ * Pinned runtime version. MUST match the SDK pin in
+ * runtime/dsh-bridge/package.json
+ *   "@deepseek-ai/dsh-sdk-client":  "0.1.1-rc.2"
+ *   "@deepseek-ai/dsh-sdk-protocol": "0.1.1-rc.2"
+ * If upstream bumps, bump both this constant and the package.json
+ * pins in lockstep.
+ *
+ * Per user decision (reviewer P1 #3, 2026-08-25): fail HARD on any
+ * drift. No patch-level leniency, no warning-only.
+ */
+export const PINNED_RUNTIME_VERSION = '0.1.1-rc.2'
+
+/**
+ * Validate the runtime-reported serverInfo against the SDK pin.
+ * Throws if the runtime version differs from the pinned version in
+ * any way (including patch-level drift).
+ *
+ * Callers should invoke this immediately after `client.initialize()`
+ * returns, before the first /sessions request is served. The bridge
+ * uses this in defaultRuntimeFactory; tests can call it directly.
+ */
+export function validateRuntimeVersion(
+  serverInfo: { name: string; version: string },
+): void {
+  if (serverInfo.version !== PINNED_RUNTIME_VERSION) {
+    throw new Error(
+      `bridge runtime version mismatch: pinned ${PINNED_RUNTIME_VERSION}, ` +
+      `runtime reports ${serverInfo.version} ` +
+      `(name=${serverInfo.name}). ` +
+      `Refusing to bridge against an SDK/runtime version drift. ` +
+      `Update PINNED_RUNTIME_VERSION in src/server.ts AND ` +
+      `@deepseek-ai/dsh-sdk-* pins in package.json in lockstep.`,
+    )
+  }
+}
+
+
+/**
  * The small surface the bridge actually drives. We use HarnessClient
  * directly (not the high-level DeepSeekHarness) so the bridge can
  * capture the wire-stable `InitializeResult.serverInfo` and surface it
@@ -186,6 +224,8 @@ export class Bridge {
         name: init.serverInfo.name,
         version: init.serverInfo.version,
       }
+      // Fail-hard on SDK/runtime version drift (reviewer P1 #3).
+      validateRuntimeVersion(serverInfo)
     } catch (err) {
       // Tear down the (failed) client before propagating so we never
       // leak a child process.
