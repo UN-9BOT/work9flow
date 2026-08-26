@@ -388,6 +388,12 @@ func (b *Bridge) Run(ctx context.Context, sessionID string, blocks []ContentBloc
 
 // readSSERun consumes the SSE stream from /sessions/:id/run. Closes
 // evCh + errCh when the bridge emits `run.end` or the stream errors.
+//
+// Activity completion contract:
+//   - The ONLY natural close of one owned Activity is `run.end{reason=idle}`.
+//   - Any other close path (transport_error, EOF without run.end, ctx cancel)
+//     is NOT a successful completion and the Runner must see ErrRunIncomplete.
+//   - sawRunEndIdle is set iff we observed a `run.end` with reason=idle.
 func (b *Bridge) readSSERun(ctx context.Context, resp *http.Response, evCh chan<- NormalizedEvent, errCh chan<- error) {
 	defer close(evCh)
 	defer close(errCh)
@@ -461,6 +467,16 @@ func (b *Bridge) readSSERun(ctx context.Context, resp *http.Response, evCh chan<
 		if err := scanner.Err(); err != nil && !errors.Is(err, io.EOF) && ctx.Err() == nil {
 			select {
 			case errCh <- err:
+			default:
+			}
+		}
+		// Stream closed without `run.end`. The Activity did NOT reach
+		// its natural terminal state — surface ErrRunIncomplete so the
+		// Runner reports the run as incomplete instead of fabricating
+		// success from a stray assistant/message.
+		if !sawTransportError && ctx.Err() == nil {
+			select {
+			case errCh <- ErrRunIncomplete:
 			default:
 			}
 		}

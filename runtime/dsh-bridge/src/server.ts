@@ -537,6 +537,9 @@ if (this.activeRuns.has(sessionId)) {
     let transportErr: unknown
     let aborted = false
     let terminated = false
+    let splicedMessageId: string | undefined
+    let reachedIdle = false
+    let messageId: string | undefined
 
     const finish = (reason: 'idle' | 'transport_error'): void => {
       if (terminated) return
@@ -551,6 +554,17 @@ if (this.activeRuns.has(sessionId)) {
       try { res.end() } catch {}
     }
 
+    const isSplicedReceipt = (ev: { type: string; data?: unknown }): boolean => {
+      if (ev.type !== 'agent/inbox/spliced') return false
+      if (!messageId) return false
+      const data = ev.data as { inserted?: Array<{ id?: string }> } | undefined
+      if (!data?.inserted) return false
+      for (const m of data.inserted) {
+        if (m?.id === messageId) return true
+      }
+      return false
+    }
+
     const pump = async (): Promise<void> => {
       try {
         for await (const notification of subscription) {
@@ -560,7 +574,23 @@ if (this.activeRuns.has(sessionId)) {
           if (ev.type === 'subagent.started') {
             this.sessionParents.set(ev.childSessionId, ev.parentSessionId)
           }
-          writeSse(res, ev)
+          // Receipt correlation: until we observe agent/inbox/spliced
+          // carrying the messageId from THIS prompt, any session.status
+          // or other activity events belong to a prior turn and must NOT
+          // close this Activity. We buffer them silently — once the
+          // receipt arrives, we forward the buffer and then live events.
+          if (!splicedMessageId) {
+            if (isSplicedReceipt(ev as { type: string; data?: unknown })) {
+              splicedMessageId = messageId
+              writeSse(res, ev)
+            } else {
+              // Drop prior-turn noise (events that arrived between
+              // subscribeSessionTree and the spliced receipt).
+              continue
+            }
+          } else {
+            writeSse(res, ev)
+          }
           // session.status=idle on the ROOT session closes the Activity.
           // Subagent descendants may also go idle independently — that
           // is not the activity close for the root session.
@@ -569,6 +599,7 @@ if (this.activeRuns.has(sessionId)) {
             ev.sessionId === sessionId &&
             ev.status === 'idle'
           ) {
+            reachedIdle = true
             finish('idle')
             return
           }
@@ -576,10 +607,19 @@ if (this.activeRuns.has(sessionId)) {
       } catch (err) {
         if (!aborted) transportErr = err
       }
-      // Subscription closed (clean) before reaching idle. Treat as
-      // transport_error so the consumer knows the activity did not
-      // reach its natural terminal state.
-      if (!terminated) finish(transportErr !== undefined ? 'transport_error' : 'idle')
+      // Subscription closed. The ONLY natural close is root
+      // session.status=idle; any other close (EOF, transport tear-down,
+      // missed idle frame) is a transport_error. Reaching this branch
+      // with `reachedIdle === false` is the failure mode the Runner
+      // detects via the missing run.end{reason=idle}.
+      if (!terminated) {
+        if (reachedIdle) {
+          finish('idle')
+        } else {
+          transportErr = transportErr ?? new Error('subscription_closed_before_root_idle')
+          finish('transport_error')
+        }
+      }
     }
 
     void pump()
@@ -590,6 +630,7 @@ if (this.activeRuns.has(sessionId)) {
       if (!terminated) {
         // Client disconnected before idle. Emit a terminal frame so the
         // server side stays consistent, then close.
+        transportErr = transportErr ?? new Error('client_disconnected_before_root_idle')
         finish('transport_error')
       }
     })
@@ -598,7 +639,7 @@ if (this.activeRuns.has(sessionId)) {
     // closes the stream with a synthetic transport_error so the
     // consumer sees one terminal frame.
     try {
-      const messageId = await session.runtime.client.prompt(sessionId, body.contentBlocks as ContentBlock[])
+      messageId = await session.runtime.client.prompt(sessionId, body.contentBlocks as ContentBlock[])
       if (aborted) return
       writeSse(res, { type: 'run.start', messageId })
     } catch (err) {

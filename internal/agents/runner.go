@@ -185,12 +185,15 @@ func (r *Runner) Run(ctx context.Context, run domain.WorkflowRun, role, model st
 	for ev := range evCh {
 		collected = append(collected, ev)
 	}
-	select {
-	case err := <-errCh:
-		if err != nil {
-			return Outcome{}, fmt.Errorf("agents: run: %w", err)
+	// Block on errCh — the bridge writes ErrRunIncomplete if the stream
+	// closed without `run.end{reason=idle}`. That is the only signal
+	// that the activity's natural close was reached; ignoring it lets
+	// a stray assistant/message fabricate success.
+	if err := <-errCh; err != nil {
+		if errors.Is(err, dsh.ErrRunIncomplete) {
+			return Outcome{}, ErrSessionIncomplete
 		}
-	default:
+		return Outcome{}, fmt.Errorf("agents: run: %w", err)
 	}
 
 	r.persistEvents(ctx, run.ID, collected)

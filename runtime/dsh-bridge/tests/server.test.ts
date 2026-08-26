@@ -649,6 +649,16 @@ test('POST /sessions/:id/run 409 when an Activity is already in progress on the 
   const c1 = new AbortController()
   const r1 = readSSE(`${base}/sessions/${sid}/run`, c1.signal, { method: 'POST', body: { contentBlocks: [{ type: 'text', text: 'go' }] } })
   await new Promise((r) => setTimeout(r, 25))
+  // Receipt for the first prompt must arrive before any session.status,
+  // otherwise the bridge's receipt-correlation guard treats status frames
+  // as prior-turn noise and the pump would never observe idle.
+  sub.push({
+    method: 'session.event',
+    params: {
+      sessionId: sid,
+      event: { type: 'agent/inbox/spliced', data: { inserted: [{ id: 'msg-1' }] } },
+    },
+  })
 
   // Second /run on the same session must 409.
   const r2 = await fetch(`${base}/sessions/${sid}/run`, {
@@ -664,6 +674,76 @@ test('POST /sessions/:id/run 409 when an Activity is already in progress on the 
   sub.push({ method: 'session.status', params: { sessionId: sid, status: 'idle' } })
   await r1
   c1.abort()
+  await bridge.close()
+})
+
+test('POST /sessions/:id/run drops prior-turn session.status noise until the inbox/spliced receipt for this prompt', async () => {
+  // Reviewer P1 #1: receipt-correlation guard. Until the bridge sees
+  // agent/inbox/spliced carrying the messageId from THIS prompt, any
+  // session.status idle frames belong to a prior turn and must NOT
+  // close this Activity.
+  const sub = makeFakeSubscription()
+  const runtime = makeFakeRuntime({
+    onSubscribe: () => sub,
+    onPrompt: () => 'msg-1',
+  })
+  const bridge = new Bridge({ port: 0, runtimeFactory: () => runtime })
+  await bridge.listen()
+  const addr = (bridge as any).server.address()
+  const base = `http://127.0.0.1:${addr.port}`
+  const created = await jsonPost(`${base}/sessions`, { cwd: '/tmp', provider: 'p', model: 'm' })
+  const sid = created.json.sessionId as any
+
+  const controller = new AbortController()
+  const readerPromise = readSSE(`${base}/sessions/${sid}/run`, controller.signal, { method: 'POST', body: { contentBlocks: [{ type: 'text', text: 'go' }] } })
+
+  await new Promise((r) => setTimeout(r, 25))
+
+  // Prior-turn noise: session.status=idle before any receipt.
+  // The pump must drop this — it would otherwise close the Activity
+  // before the current prompt is spliced.
+  sub.push({ method: 'session.status', params: { sessionId: sid, status: 'idle' } })
+  sub.push({ method: 'session.status', params: { sessionId: sid, status: 'running' } })
+
+  // Give the pump time to (incorrectly) close if the guard is missing.
+  await new Promise((r) => setTimeout(r, 50))
+  // Reader must still be open: nothing has been emitted yet.
+  // We can't directly inspect a hanging ReadableStream; instead we
+  // emit the receipt and observe that the activity then runs to idle.
+
+  // Now the receipt: agent/inbox/spliced for THIS prompt.
+  sub.push({
+    method: 'session.event',
+    params: {
+      sessionId: sid,
+      event: { type: 'agent/inbox/spliced', data: { inserted: [{ id: 'msg-1' }] } },
+    },
+  })
+  // Receipt followed by an assistant message and root idle.
+  sub.push({
+    method: 'session.event',
+    params: {
+      sessionId: sid,
+      event: { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'hi' }] } } },
+    },
+  })
+  sub.push({ method: 'session.status', params: { sessionId: sid, status: 'idle' } })
+
+  const out = await readerPromise
+  // Expect: run.start, agent/inbox/spliced, assistant/message,
+  // session.status(idle), run.end. The prior-turn idle and running
+  // frames were dropped before the receipt.
+  const types = out.map((e: any) => e.type)
+  assert.deepEqual(types, [
+    'run.start',
+    'agent/inbox/spliced',
+    'assistant/message',
+    'session.status',
+    'run.end',
+  ])
+  const end = out.find((e: any) => e.type === 'run.end') as any
+  assert.ok(end, 'run.end frame must be present')
+  assert.equal(end.reason, 'idle')
   await bridge.close()
 })
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -190,6 +191,53 @@ func TestBridgeCreateSession(t *testing.T) {
 	}
 	if ref.ID != "sess-deepseek-chat" {
 		t.Errorf("ID = %q", ref.ID)
+	}
+}
+
+// TestRunEOFWithoutRunEndYieldsErrRunIncomplete covers reviewer P1 #2:
+// if the bridge closes the SSE stream before emitting run.end, the
+// caller must see ErrRunIncomplete — never a fabricated success from
+// a stray assistant/message.
+func TestRunEOFWithoutRunEndYieldsErrRunIncomplete(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ready"}`))
+	})
+	mux.HandleFunc("POST /sessions", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"sessionId":"s1","serverInfo":{"name":"x","version":"0"}}`))
+	})
+	mux.HandleFunc("POST /sessions/{id}/run", func(w http.ResponseWriter, _ *http.Request) {
+		// Emit a single assistant/message then close the stream without
+		// emitting run.end. This is the failure mode the guard detects.
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"type":"run.start","messageId":"m1"}`)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", `{"type":"assistant/message","sessionId":"s1","data":{"message":{"content":[{"type":"text","text":"{\"outcome\":\"advance\"}"}]}}}`)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		// Close without run.end.
+	})
+	b := dsh.NewBridge("http://127.0.0.1:1")
+	b.SetHTTPClient(&http.Client{Timeout: time.Second})
+	b.SetStreamHTTPClient(&http.Client{})
+	// Spin up the test server on a real listener.
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil { t.Fatal(err) }
+	addr := lis.Addr().String()
+	go func() { _ = http.Serve(lis, mux) }()
+	defer lis.Close()
+	b = dsh.NewBridge("http://" + addr)
+	evCh, errCh := b.Run(context.Background(), "s1", []dsh.ContentBlock{{Type: "text", Text: "go"}})
+	var got int
+	for range evCh { got++ }
+	runErr := <-errCh
+	if !errors.Is(runErr, dsh.ErrRunIncomplete) {
+		t.Fatalf("err = %v, want ErrRunIncomplete", runErr)
+	}
+	if got == 0 {
+		t.Errorf("expected the upstream assistant/message to be forwarded before the guard fires")
 	}
 }
 

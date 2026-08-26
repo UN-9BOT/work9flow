@@ -58,12 +58,19 @@ export type SubagentStopReason = string
  */
 export type SessionEventType =
   | 'agent/inbox/spliced'
+  | 'turn/start'
+  | 'turn/end'
+  | 'step/start'
+  | 'step/end'
+  | 'user/message'
+  | 'assistant/chunk'
   | 'assistant/message'
   | 'tool/call'
   | 'tool/result'
-  | 'step/start'
-  | 'step/end'
-  | 'turn/end'
+  | 'todo/write'
+  | 'request/header'
+  | 'request/context'
+  | 'session/end-seed'
 
 /** Closed set of `type` values the bridge emits on its SSE streams. */
 export type BridgeEventType =
