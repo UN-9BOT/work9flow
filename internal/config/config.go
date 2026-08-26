@@ -6,7 +6,8 @@
 package config
 
 import (
-	"errors"
+	"bytes"
+"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -58,7 +59,14 @@ func Load(path string) (Config, error) {
 		if err != nil {
 			return cfg, fmt.Errorf("read config %s: %w", path, err)
 		}
-		if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		// Strict YAML loader: any unknown key (e.g. legacy `providers_file`)
+		// produces an explicit removed-config error instead of being silently
+		// dropped. Per bead work9flow-8w0 review P1: "old providers_file
+		// silently ignored" is bad migration semantics — config that looks
+		// accepted but silently disables execution.
+		dec := yaml.NewDecoder(bytes.NewReader(raw))
+		dec.KnownFields(true)
+		if err := dec.Decode(&cfg); err != nil {
 			return cfg, fmt.Errorf("parse config %s: %w", path, err)
 		}
 	}

@@ -16,7 +16,7 @@ runtime/dsh-bridge/
 ├── tsconfig.json
 ├── src/
 │   ├── launcher.ts   spawn dsh-jsonrpc-agent (exe or dev node carrier)
-│   ├── server.ts     HTTP server + DeepSeekHarness wrapper
+│   ├── server.ts     HTTP server + HarnessClient wrapper
 │   └── types.ts      wire types
 └── tests/
     ├── launcher.test.ts  pure launcher tests
@@ -45,7 +45,7 @@ type BridgeEvent =
   | { kind: 'bridge.error'; message: string }
 ```
 
-## Runtime resolution
+## Build & Runtime resolution
 
 Two carriers (see upstream
 [python/sdk-runtime/README.md](https://github.com/deepseek-ai/deepseek-harness/blob/master/python/sdk-runtime/README.md)):
@@ -56,17 +56,18 @@ Two carriers (see upstream
   `runtime/node/node_modules/@deepseek-ai/dsh-sdk-jsonrpc-demo/lib/packaged-bin.js`.
   Must be opted into via `DSH_RUNTIME_MODE=node` or `BridgeOptions.launch.mode = 'node'`.
 
-Resolution priority:
+Resolution priority (explicit-only — bead 4i1 closed the auto-resolver):
 
 1. `BridgeOptions.launch.exePath` / `nodeBinJs`
 2. `DSH_RUNTIME_EXE` / `DSH_NODE_BIN_JS` env vars
 3. `DSH_RUNTIME_MODE` env (`exe` | `node`); default = `exe`
-4. Conventional dev path under `runtime/node/...` (node mode)
-5. `dsh-jsonrpc-agent-pkg-<platform>-<arch>` on PATH (exe mode)
 
-When the lookup fails the bridge fails loudly with a message naming both
-acquisition routes (install the wheel or set the explicit path). This is a
-deliberate departure from any silent fallback.
+The bridge NEVER searches PATH, never guesses `<platform>-<arch>`, and
+never inspects `./.dsh-runtime/`. The operator MUST set the explicit
+path or env var. When the lookup fails the bridge fails loudly with a
+message naming both acquisition routes (install the wheel or set the
+explicit path). This is a deliberate departure from any silent
+fallback.
 
 ## What is NOT here
 
@@ -77,12 +78,12 @@ deliberate departure from any silent fallback.
 - No `localdsh`-style OpenAI-compatible passthrough — the bridge always
   goes through the real DSH runtime.
 
-## Run
+## Build & Run
 
 ```bash
 cd runtime/dsh-bridge
 npm install
-DSH_CORDIS_CONFIG=/path/to/cordis.yml npm start
+DSH_CORDIS_CONFIG=/path/to/cordis.yml npm run build && npm start
 ```
 
 (or, for dev with source-built runtime:)
@@ -97,7 +98,7 @@ npm start
 ## Test
 
 ```bash
-npm test          # 14 tests, no runtime needed
+npm test          # 26 tests, no runtime needed
 ```
 
 The HTTP-layer tests use a `harnessFactory` injection — a fake

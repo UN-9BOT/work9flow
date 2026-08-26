@@ -89,18 +89,34 @@ iteration_limits:
 
 ## LLM-провайдеры
 
-`work9flowd` не boot-ит LLM-провайдера сам. Он только подключается к
-`runtime/dsh-bridge` через `dsh_bridge_addr`, а тот в свою очередь
-управляет upstream DeepSeek Harness runtime'ом и его каталогом
-провайдеров (см. `runtime/dsh-bridge/COMPATIBILITY.md` и
-`runtime/dsh-bridge/README.md`).
+`work9flowd` и `runtime/dsh-bridge` — это **два разных процесса**.
+`work9flowd` НЕ запускает dsh-bridge; он только подключается к нему
+через `dsh_bridge_addr`. dsh-bridge в свою очередь управляет upstream
+DeepSeek Harness runtime'ом и его cordis-каталогом провайдеров (см.
+`runtime/dsh-bridge/COMPATIBILITY.md` и `runtime/dsh-bridge/README.md`).
 
-Поддерживается любой OpenAI- или Anthropic-совместимый endpoint,
-который зарегистрирован в upstream DSH cordis-плагине. Сюда входит
-и `minimax` (`https://api.minimax.io/v1`), и любой другой
-OpenAI-совместимый LLM-провайдер.
+Полный запуск выглядит так:
 
-Запуск: `export DSH_RUNTIME_EXE=... && work9flowd --config=work9flow.yaml`.
+```bash
+# shell A: dsh-bridge + upstream DSH runtime
+cd runtime/dsh-bridge
+npm install
+npm run build
+export DSH_RUNTIME_EXE=/path/to/dsh-jsonrpc-agent-pkg-<os>-<arch>
+export DSH_CORDIS_CONFIG=/path/to/cordis.yml
+npm start -- --port 7770
+
+# shell B: work9flowd Go daemon
+export WORK9FLOW_DSH_BRIDGE_ADDR=http://127.0.0.1:7770
+./bin/work9flowd --config=work9flow.yaml
+```
+
+Какие endpoint'ы поддерживаются, решает upstream DSH cordis-каталог.
+`work9flowd` не навязывает свой выбор — он только проксирует JSON-RPC
+к dsh-bridge. Любой провайдер, для которого реальная cordis-composition
+зарегистрировала соответствующий adapter (например, `minimax` через
+`https://api.minimax.io/v1`), работает; неизвестные провайдеры DSH не
+создаёт автоматически.
 
 ## Статус
 
