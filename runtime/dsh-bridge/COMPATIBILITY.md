@@ -13,7 +13,8 @@ That provenance lives here, and is enforced out-of-band by:
   recorded below,
 - the real-assembled smoke test (tracked in
   bead `work9flow-7dh`) which spawns a runtime built from this commit
-  and observes a full prompt cycle against a real LLM.
+  and runs an end-to-end prompt cycle through a real DSH runtime with
+  an assembled provider path.
 
 If any of these change, all three must be bumped in lockstep:
 `COMPATIBILITY.md` ← this file, `package.json` ← npm pins,
@@ -26,7 +27,7 @@ intentionally bumps the protocol identity).
 | ----------------------- | ---------------------------------------------- |
 | `sdkClient`             | `@deepseek-ai/dsh-sdk-client@0.1.1-rc.2`       |
 | `sdkProtocol`           | `@deepseek-ai/dsh-sdk-protocol@0.1.1-rc.2`     |
-| `upstreamCommit`        | `b150a551` (TODO: pin full SHA when verified)  |
+| `upstreamCommit`        | `b150a551b8d465e31e418e1b2eaf5e79bbb7d28e`     |
 | `runtimeServer.name`    | `deepseek-harness-sdk-runtime`                 |
 | `runtimeServer.version` | `0.0.1` (matches `EXPECTED_SERVER_INFO`)       |
 
@@ -62,6 +63,6 @@ reviewer rejected (REQUEST_CHANGES on commit `ff4517e`).
 ## Out of scope for this manifest
 
 - The runtime's full build hash (sha256 of the executable). That
-  belongs on the runtime artifact itself, enforced by the operator's
-  supply chain. The bridge only checks the protocol identity and
-  trusts the npm pins.
+  belongs on the runtime artifact itself, enforced by the operator's supply chain. The bridge only checks the
+  protocol identity and trusts the npm pins; the real-DSH gate
+  (`work9flow-7dh`) is what closes the loop end-to-end.

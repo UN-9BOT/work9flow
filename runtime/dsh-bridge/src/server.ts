@@ -77,7 +77,10 @@ export const EXPECTED_SERVER_INFO = {
  *   - missing/empty/malformed serverInfo fields
  *
  * Per user decision (reviewer P1 #3, 2026-08-25): fail HARD on any
- * mismatch. No patch-level leniency, no warning-only.
+ * server protocol identity drift. No patch-level leniency, no
+ * warning-only. (This validates the wire-stable initialize.serverInfo,
+ * NOT the npm SDK release pin — see COMPATIBILITY.md for the two
+ * version surfaces.)
  *
  * Callers should invoke this immediately after `client.initialize()`
  * returns, before the first /sessions request is served. The bridge
