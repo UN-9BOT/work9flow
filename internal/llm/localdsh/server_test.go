@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/unbot/work9flow/internal/llm/openai"
 )
@@ -50,23 +49,26 @@ func TestServerSessionLifecycle(t *testing.T) {
 	srv, _ := newServerWithFake(t, "I scouted the repo. outcome: advance")
 
 	// create session
-	resp, err := http.Post(srv.URL+"/v1/sessions", "application/json",
-		strings.NewReader(`{"role":"scout","model":"fake-model"}`))
+	resp, err := http.Post(srv.URL+"/sessions", "application/json",
+		strings.NewReader(`{"cwd":"/tmp","provider":"fake","model":"fake-model"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var created struct{ ID string `json:"id"` }
+	var created struct {
+		SessionID string `json:"sessionId"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&created); err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if created.ID == "" {
+	if created.SessionID == "" {
 		t.Fatal("no session id")
 	}
 
-	// followup
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/sessions/"+created.ID+"/followup",
-		strings.NewReader(`{"message":"hi","data":null}`))
+	// prompt
+	promptBody := strings.NewReader(`{"contentBlocks":[{"type":"text","text":"hi"}]}`)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/sessions/"+created.SessionID+"/prompt", promptBody)
+	req.Header.Set("Content-Type", "application/json")
 	if resp, err := http.DefaultClient.Do(req); err != nil {
 		t.Fatal(err)
 	} else {
@@ -74,28 +76,99 @@ func TestServerSessionLifecycle(t *testing.T) {
 	}
 
 	// events
-	r, err := http.Get(srv.URL + "/v1/sessions/" + created.ID + "/events")
+	r, err := http.Get(srv.URL + "/sessions/" + created.SessionID + "/events")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer r.Body.Close()
-	if r.Header.Get("Content-Type") != "application/x-ndjson" {
+	if !strings.HasPrefix(r.Header.Get("Content-Type"), "text/event-stream") {
 		t.Errorf("content-type = %q", r.Header.Get("Content-Type"))
 	}
 	scanner := bufio.NewScanner(r.Body)
-	if !scanner.Scan() {
-		t.Fatal("no events")
+	var foundAgentCompleted bool
+	var foundIdle bool
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var ev map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err != nil {
+			t.Fatal(err)
+		}
+		if ev["kind"] == "session.event" {
+			inner, _ := ev["event"].(map[string]any)
+			if inner != nil && inner["kind"] == "agent.completed" {
+				foundAgentCompleted = true
+				data, _ := inner["data"].(map[string]any)
+				if data == nil || data["outcome"] != "advance" {
+					t.Errorf("agent.completed outcome = %v", data)
+				}
+			}
+		}
+		if ev["kind"] == "session.status" && ev["status"] == "idle" {
+			foundIdle = true
+		}
 	}
-	var ev map[string]any
-	if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
+	if !foundAgentCompleted {
+		t.Error("no session.event agent.completed frame")
+	}
+	if !foundIdle {
+		t.Error("no session.status=idle frame")
+	}
+}
+
+func TestServerHealth(t *testing.T) {
+	srv, _ := newServerWithFake(t, "ok")
+	resp, err := http.Get(srv.URL + "/health")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if ev["kind"] != "agent.completed" {
-		t.Errorf("kind = %v", ev["kind"])
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Errorf("status = %d", resp.StatusCode)
 	}
-	data, _ := ev["data"].(map[string]any)
-	if data["outcome"] != "advance" {
-		t.Errorf("outcome = %v", data["outcome"])
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["status"] != "ready" {
+		t.Errorf("status = %v", body["status"])
+	}
+}
+
+func TestServerCloseSessionReturns501(t *testing.T) {
+	srv, _ := newServerWithFake(t, "ok")
+	// mint a session first
+	resp, _ := http.Post(srv.URL+"/sessions", "application/json",
+		strings.NewReader(`{"cwd":"/tmp","provider":"fake","model":"m"}`))
+	var c struct {
+		SessionID string `json:"sessionId"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&c)
+	resp.Body.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/sessions/"+c.SessionID+"/close", nil)
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusNotImplemented {
+		t.Errorf("status = %d, want 501", r.StatusCode)
+	}
+}
+
+func TestServerShutdownReturns204(t *testing.T) {
+	srv, _ := newServerWithFake(t, "ok")
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/shutdown", nil)
+	r, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Body.Close()
+	if r.StatusCode != http.StatusNoContent {
+		t.Errorf("status = %d, want 204", r.StatusCode)
 	}
 }
 
@@ -159,5 +232,3 @@ func TestOpenAIIntegrationWithLocalDSH(t *testing.T) {
 		t.Errorf("got %+v", resp)
 	}
 }
-
-var _ = time.Second // keep time import if not used

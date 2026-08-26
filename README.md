@@ -62,7 +62,7 @@ make test          # go test ./...
 make vet           # go vet ./...
 make tidy          # go mod tidy
 make smoke         # boot runtime + CRUD endpoints + TUI --once
-make smoke-full    # boot inline DSH + scripted provider, drive run → DONE
+# `make smoke-full` was REMOVED in bead work9flow-8w0 (dsh-A.10e) — see Статус below.
 make healthcheck   # non-interactive work9flow --once
 make run-runtime   # запустить work9flowd на 127.0.0.1:7469
 ```
@@ -74,55 +74,58 @@ SQLite database: `<state_dir>/work9flow.db`.
 
 1. `Defaults()` (`http://127.0.0.1:7469`, XDG state dir).
 2. YAML: `--config work9flow.yaml`.
-3. ENV: `WORK9FLOW_STATE_DIR`, `WORK9FLOW_RUNTIME_ENDPOINT`, `WORK9FLOW_DSH_ENDPOINT`, `WORK9FLOW_WORKSPACE_DIR`, `WORK9FLOW_PROVIDERS_FILE`.
+3. ENV: `WORK9FLOW_STATE_DIR`, `WORK9FLOW_RUNTIME_ENDPOINT`, `WORK9FLOW_DSH_BRIDGE_ADDR`, `WORK9FLOW_WORKSPACE_DIR`.
 
 `work9flow.yaml` пример:
 
 ```yaml
 state_dir: ~/.local/state/work9flow
 runtime_endpoint: http://127.0.0.1:7469
-# dsh_endpoint: http://127.0.0.1:7770   # опционально: внешний DSH (Node)
-providers_file: ./providers.toml         # альтернана — поднять inline DSH
+# dsh_bridge_addr: http://127.0.0.1:7770   # external dsh-bridge (Node)
 iteration_limits:
   default: 5
   implementing: 3
-model_roles:
-  default: minim/MiniMax-M3
 ```
 
-## Провайдеры (`providers.toml`)
+## LLM-провайдеры
 
-`providers.toml` описывает LLM-провайдеров с OpenAI-совместимым API.
-Файл подгружается при старте `work9flowd`, когда `dsh_endpoint` пуст —
-демон сам поднимает маленький DSH-совместимый HTTP-сервер, который
-перенаправляет сессии в указанный провайдер. Это позволяет гонять
-полный feature-development pipeline (scout → planner → gatekeeper →
-implementer → reviewer) без внешнего Node-процесса DSH.
+`work9flowd` и `runtime/dsh-bridge` — это **два разных процесса**.
+`work9flowd` НЕ запускает dsh-bridge; он только подключается к нему
+через `dsh_bridge_addr`. dsh-bridge в свою очередь управляет upstream
+DeepSeek Harness runtime'ом и его cordis-каталогом провайдеров (см.
+`runtime/dsh-bridge/COMPATIBILITY.md` и `runtime/dsh-bridge/README.md`).
 
-```toml
-[minim]
-display_name = "Custom (minim)"
-protocol     = "openai"
-base_url     = "https://api.minimax.io/v1"
-api_key_env  = "MINIM_API_KEY"
-default_model = "minim/MiniMax-M3"
+Полный запуск выглядит так:
 
-[[minim.models]]
-id = "MiniMax-M3"
-tier = "strong"
-context_window = 400000
-max_output_tokens = 131072
-supports_thinking = true
-supports_vision = true
+```bash
+# shell A: dsh-bridge + upstream DSH runtime
+cd runtime/dsh-bridge
+npm install
+npm run build
+export DSH_RUNTIME_EXE=/path/to/dsh-jsonrpc-agent-pkg-<os>-<arch>
+export DSH_CORDIS_CONFIG=/path/to/cordis.yml
+npm start -- --port 7770
+
+# shell B: work9flowd Go daemon
+export WORK9FLOW_DSH_BRIDGE_ADDR=http://127.0.0.1:7770
+./bin/work9flowd --config=work9flow.yaml
 ```
 
-Запуск с реальным minim: `export MINIM_API_KEY=... && work9flowd --config=work9flow.yaml`.
+Какие endpoint'ы поддерживаются, решает upstream DSH cordis-каталог.
+`work9flowd` не навязывает свой выбор — он только проксирует JSON-RPC
+к dsh-bridge. Любой провайдер, для которого реальная cordis-composition
+зарегистрировала соответствующий adapter (например, `minimax` через
+`https://api.minimax.io/v1`), работает; неизвестные провайдеры DSH не
+создаёт автоматически.
 
 ## Статус
 
 MVP 01–07 закрыты (см. `bd list` / `git log --oneline`). CRUD-слой,
 state machine, DSH-адаптер, агенты (scout/planner/gatekeeper/implementer/reviewer),
-TUI, inline OpenAI-провайдер и `minim` зарегистрированы. Полный pipeline
-end-to-end проверяется через `make smoke-full` (run доходит до DONE через
-inline DSH + scripted OpenAI-провайдер). Реальный запуск с `minim` —
-`export MINIM_API_KEY=... && work9flowd --config=work9flow.yaml`.
+TUI, dsh-bridge зарегистрирован.
+
+**Full real-DSH E2E is NOT yet a passed gate.** `make smoke-full`
+был удалён вместе с production localdsh path (bead work9flow-8w0).
+Новый assembled real-DSH gate появится в bead `work9flow-7dh`
+после того, как будет собран `dsh-jsonrpc-agent` runtime и
+`runtime/dsh-bridge` начнёт им управлять end-to-end.

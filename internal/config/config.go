@@ -6,7 +6,8 @@
 package config
 
 import (
-	"errors"
+	"bytes"
+"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,15 +19,14 @@ import (
 type Config struct {
 	StateDir        string            `yaml:"state_dir"`
 	RuntimeEndpoint string            `yaml:"runtime_endpoint"`
-	DSHEndpoint     string            `yaml:"dsh_endpoint"`
+	DSHBridgeAddr     string            `yaml:"dsh_bridge_addr"`
 	WorkspaceDir    string            `yaml:"workspace_dir"`
 	IterationLimits map[string]int    `yaml:"iteration_limits"`
 	ModelRoles      map[string]string `yaml:"model_roles"`
-	// ProvidersFile points at a TOML file describing LLM providers
-	// (e.g. providers.toml). When DSHEndpoint is empty and this is
-	// set, work9flowd boots an inline OpenAI-compatible DSH that
-	// routes requests through the named provider/model from ModelRoles.
-	ProvidersFile   string            `yaml:"providers_file"`
+	// work9flowd only boots through dsh_bridge_addr. The previous inline
+	// OpenAI-compatible DSH path (ProvidersFile + WORK9FLOW_PROVIDERS_FILE)
+	// was removed in bead work9flow-8w0 (dsh-A.10e, P1). Tests that need a
+	// fake DSH use internal/llm/localdsh directly.
 }
 
 // Defaults returns a Config populated with safe local defaults.
@@ -59,7 +59,14 @@ func Load(path string) (Config, error) {
 		if err != nil {
 			return cfg, fmt.Errorf("read config %s: %w", path, err)
 		}
-		if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		// Strict YAML loader: any unknown key (e.g. legacy `providers_file`)
+		// produces an explicit removed-config error instead of being silently
+		// dropped. Per bead work9flow-8w0 review P1: "old providers_file
+		// silently ignored" is bad migration semantics — config that looks
+		// accepted but silently disables execution.
+		dec := yaml.NewDecoder(bytes.NewReader(raw))
+		dec.KnownFields(true)
+		if err := dec.Decode(&cfg); err != nil {
 			return cfg, fmt.Errorf("parse config %s: %w", path, err)
 		}
 	}
@@ -77,14 +84,11 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("WORK9FLOW_RUNTIME_ENDPOINT"); v != "" {
 		cfg.RuntimeEndpoint = v
 	}
-	if v := os.Getenv("WORK9FLOW_DSH_ENDPOINT"); v != "" {
-		cfg.DSHEndpoint = v
+	if v := os.Getenv("WORK9FLOW_DSH_BRIDGE_ADDR"); v != "" {
+		cfg.DSHBridgeAddr = v
 	}
 	if v := os.Getenv("WORK9FLOW_WORKSPACE_DIR"); v != "" {
 		cfg.WorkspaceDir = v
-	}
-	if v := os.Getenv("WORK9FLOW_PROVIDERS_FILE"); v != "" {
-		cfg.ProvidersFile = v
 	}
 }
 

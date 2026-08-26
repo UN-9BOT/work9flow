@@ -1,0 +1,25 @@
+{
+  "name": "@work9flow/dsh-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Thin TypeScript bridge: work9flow <-> @deepseek-ai/dsh-sdk-client <-> dsh-jsonrpc-agent runtime subprocess.",
+  "scripts": {
+    "build": "tsc",
+    "start": "node lib/server.js",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-sdk-client": "0.1.1-rc.2",
+    "@deepseek-ai/dsh-sdk-protocol": "0.1.1-rc.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.5",
+    "tsx": "4.19.2",
+    "typescript": "5.7.3"
+  },
+  "engines": {
+    "node": ">=22.19"
+  }
+}

@@ -404,6 +404,18 @@ const (
 	EventKindAttentionResolved       EventKind = "attention.resolved"
 	EventKindSteerSent               EventKind = "user.steer"
 	EventKindFollowupSent            EventKind = "user.followup"
+	// EventKindAgentRunning marks a transient upstream session.status=running
+	// notification. Distinct from EventKindAgentStarted because a session can
+	// go idle->running->idle many times during a single activity interval.
+	EventKindAgentRunning            EventKind = "agent.running"
+	// EventKindAgentIdle marks the upstream session.status=idle notification,
+	// which upstream API documents as the activity-interval terminator.
+	EventKindAgentIdle               EventKind = "agent.idle"
+	// EventKindRawPassthrough is used by the DSH bridge when it cannot
+	// map an upstream notification kind to any known work9flow kind. The
+	// raw payload is preserved verbatim under Event.Data so consumers can
+	// audit the gap instead of silently dropping the event.
+	EventKindRawPassthrough          EventKind = "raw.passthrough"
 )
 
 // Event is one entry in a run's append-only event log.

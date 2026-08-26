@@ -43,8 +43,12 @@ healthcheck: build ##  # non-interactive TUI run
 smoke: build ##  # boot runtime, exercise endpoints, shut down
 	@./scripts/smoke.sh $(ADDR)
 
-smoke-full: build ##  # boot inline DSH + scripted provider, drive run to DONE
-	@./scripts/smoke-full.sh $(ADDR)
+# smoke-full was REMOVED in bead work9flow-8w0 (dsh-A.10e).
+# It booted the inline OpenAI-compatible DSH path that no longer
+# exists in production. It will be re-added once bead work9flow-7dh
+# (assembled real-DSH smoke with minimax) lands — until then there is
+# no e2e gate that proves a run reaches DONE. See
+# runtime/dsh-bridge/tests/ for unit coverage of the new path.
 
 clean: ##  # remove ./bin
 	unlink -f $(BIN_DIR)/work9flowd $(BIN_DIR)/work9flow 2>/dev/null || true

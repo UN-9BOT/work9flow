@@ -2,6 +2,87 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
+## work9flow architecture invariants
+
+Hand-written rules from the foundation message. Any future change that
+breaks one of these requires opening a migration bead first — these
+are hard constraints, not guidelines. See `ARCHITECTURE.md` for
+process + dependency layout this section assumes.
+
+1. **orchestrator-not-runtime** — work9flowd orchestrates workflow
+   runs (state machine, stages, agents); it does NOT host an LLM
+   runtime. All LLM execution happens in the upstream DeepSeek
+   Harness (DSH) Node process; work9flowd only speaks to it via
+   internal/dsh.
+2. **upstream-inspection** — before adding any DSH capability
+   (session/create, prompt, events, steer, followup, cancel,
+   subagent, content-block), inspect the upstream
+   `packages/sdk/client/src/api.ts` and `protocol/src/types.ts`
+   in `deepseek-ai/deepseek-harness` first. Capability gaps are
+   declared honestly with `ErrNotSupported`, never papered over.
+3. **bridge-as-only-boundary** — the ONLY Go-side boundary into DSH
+   is `internal/dsh.Bridge`. No other package imports
+   `@deepseek-ai/dsh-session`, JSON-RPC types, or hand-rolls a
+   transport. The runtime/dsh-bridge TypeScript process owns the
+   JSON-RPC transport and the upstream SDK.
+4. **no-prod-mocks** — production code never carries a mock path
+   (no `if dev { stub }`, no env-flag-gated fake DSH). Test doubles
+   live under `*_test.go` and are wired only by tests.
+5. **no-fork-no-vendor** — never fork the upstream DSH SDK; never
+   vendor a third-party SDK in lieu of upstream. Upstream-version
+   pinning is the supported upgrade path (see rule 14).
+6. **artifact-protocol** — cross-stage data is carried by
+   durable versioned artifacts, persisted by the engine via
+   `storage.AddArtifact` and consumed by downstream stages via
+   `storage.ListArtifacts`. Artifact content MAY contain
+   repo-relative paths and symbol references — that is the
+   work9flow contract, not a property of any specific DSH event
+   vocabulary (mocks that bind artifacts to a particular upstream
+   event field are forbidden).
+7. **immutable-task** — `WorkflowRun.OriginalTask` and `RepoPath`
+   are set at create-time and never mutated afterwards. Any
+   re-scoping is a NEW run.
+8. **llm-evidence-not-routing** — the LLM (agent) emits
+   `review_findings[{class,statement,evidence,...}]` as evidence;
+   the engine routes state transitions on those classes via
+   `domain.FindingClass.IsBlocking()`. The agent never decides
+   routing — only its evidence is consumed.
+9. **fail-closed** — partial execution is never reported as
+   success. If a stage runner returns an error, the run transitions
+   to FAILED with the error wrapped in `TerminalReason`. No
+   "outcome=advance" swallowed errors.
+10. **blocking-attention** — when an agent emits
+    `outcome=wait_user` (or a `REQUIREMENT_AMBIGUITY` /
+    `BLOCKING_DECISION` finding), the engine MUST materialise a
+    domain.Attention with status=OPEN before the run stops
+    advancing. Attention close resumes the run, not raw
+    `outcome=advance`.
+11. **explicit-next-stage** — every transition names an
+    explicit next workflow stage id or a terminal outcome. Never
+    derive the next step from `RunState` or map order; otherwise a
+    generic multi-workflow engine re-binds to one workflow's
+    feature-development states. The engine rejects a transition
+    that does not name a known stage id or terminal outcome.
+12. **persisted-then-published** — events are appended to storage
+    BEFORE the WS publish is attempted (`storage.AppendEvent` is
+    the source of truth). Publish is best-effort; replay covers
+    missed subscribers.
+13. **no-fake-capabilities** — features like steer, followup,
+    cancel, per-session close, etc. that the upstream DSH SDK does
+    NOT expose are NOT invented at the Go layer. We return
+    `ErrNotSupported` (HTTP 501 from the bridge) and let the
+    caller decide.
+14. **upgrade-via-pinned-suite** — DSH upgrade means bumping the
+    pinned versions in `runtime/dsh-bridge/package.json` (sdk
+    + protocol + jsonrpc-agent wheel) AT THE SAME COMMIT as any
+    work9flow surface adjustment. No partial drift.
+15. **mocks-prove-controller-not-dsh** — `*_test.go` mocks prove
+    the work9flow controller (engine state machine, agents.Runner
+    wiring, bridge HTTP client parsing). They prove NOTHING about
+    DSH itself; the only honest evidence for DSH is running
+    `runtime/dsh-bridge/` against the upstream SDK with a real
+    provider (DEEPSEEK_API_KEY smoke).
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:6cd5cc61 -->
 ## Beads Issue Tracker
 

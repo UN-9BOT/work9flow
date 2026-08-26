@@ -3,9 +3,9 @@ package worker_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,62 +21,114 @@ import (
 	"github.com/unbot/work9flow/internal/storage"
 )
 
-// scriptedDSH returns a scripted event stream per session.
+// scriptedDSH is a minimal mock for the runtime/dsh-bridge HTTP surface.
+// Session ids are assigned per creation order so the script map can be
+// keyed by agent role independent of upstream DSH provider/model wiring.
 type scriptedDSH struct {
-	mu     sync.Mutex
-	script map[string][]dsh.RawEvent
+	mu           sync.Mutex
+	script       map[string][]dsh.RawBridgeEvent
+	createdOrder []string
 }
 
-func newScriptedDSH() *scriptedDSH { return &scriptedDSH{script: map[string][]dsh.RawEvent{}} }
+func newScriptedDSH() *scriptedDSH {
+	return &scriptedDSH{script: map[string][]dsh.RawBridgeEvent{}}
+}
 
 func (s *scriptedDSH) handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
-	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
-		var req dsh.SessionRequest
-		_ = json.NewDecoder(r.Body).Decode(&req)
-		_, _ = w.Write([]byte(`{"id":"sess-` + req.Role + `"}`))
-	})
-	mux.HandleFunc("/v1/sessions/", func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, "/v1/sessions/")
-		parts := strings.SplitN(path, "/", 2)
-		if len(parts) < 2 {
-			http.Error(w, "bad", http.StatusBadRequest)
-			return
-		}
-		sid, op := parts[0], parts[1]
-		if op != "events" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
+	mux.HandleFunc("POST /sessions", func(w http.ResponseWriter, _ *http.Request) {
 		s.mu.Lock()
-		evs := append([]dsh.RawEvent(nil), s.script[sid]...)
+		idx := len(s.createdOrder) + 1
+		id := fmt.Sprintf("sess-%d", idx)
+		s.createdOrder = append(s.createdOrder, id)
 		s.mu.Unlock()
-		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = fmt.Fprintf(w, `{"sessionId":%q,"serverInfo":{"name":"scripted-dsh","version":"test"}}`, id)
+	})
+	mux.HandleFunc("POST /sessions/{id}/prompt", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"messageId":"msg-stub"}`))
+	})
+	mux.HandleFunc("POST /sessions/{id}/run", func(w http.ResponseWriter, r *http.Request) {
+		sid := r.PathValue("id")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "close")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		write := func(ev dsh.RawBridgeEvent) {
+			b, _ := json.Marshal(ev)
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		write(dsh.RawBridgeEvent{Type: "run.start", MessageID: "msg-" + sid})
+		s.mu.Lock()
+		evs := append([]dsh.RawBridgeEvent(nil), s.script[sid]...)
+		s.mu.Unlock()
+		for _, e := range evs {
+			write(e)
+		}
+		write(dsh.RawBridgeEvent{Type: "run.end", Reason: "idle"})
+	})
+	mux.HandleFunc("GET /sessions/{id}/events", func(w http.ResponseWriter, r *http.Request) {
+		sid := r.PathValue("id")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		flusher, _ := w.(http.Flusher)
+		s.mu.Lock()
+		evs := append([]dsh.RawBridgeEvent(nil), s.script[sid]...)
+		s.mu.Unlock()
 		for _, e := range evs {
 			b, _ := json.Marshal(e)
+			_, _ = w.Write([]byte("data: "))
 			_, _ = w.Write(b)
-			_, _ = w.Write([]byte("\n"))
+			_, _ = w.Write([]byte("\n\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
 		}
+	})
+	mux.HandleFunc("POST /sessions/{id}/close", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotImplemented)
+	})
+	mux.HandleFunc("POST /shutdown", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
 	})
 	return mux
 }
 
-func defaultAdvanceScript() map[string][]dsh.RawEvent {
-	now := time.Now().UTC()
-	mk := func(role string) []dsh.RawEvent {
-		return []dsh.RawEvent{
-			{SessionID: "sess-" + role, Kind: "agent.completed", At: now, Data: mustJSON(map[string]string{"outcome": "advance"})},
-		}
+// assistantFrame emits an upstream-style assistant/message event
+// carrying a JSON content block with the agent's work9flow contract
+// (outcome / summary / findings / artifacts). Per upstream DSH the
+// assistant message is the agent's terminal response — there is no
+// invented agent.completed upstream.
+func assistantFrame(sid, summary string) dsh.RawBridgeEvent {
+	payload := map[string]any{
+		"role": "assistant",
+		"content": []map[string]any{{
+			"type": "text",
+			"text": fmt.Sprintf(`{"outcome":"advance","summary":%q}`, summary),
+		}},
 	}
-	return map[string][]dsh.RawEvent{
-		"sess-scout":       mk("scout"),
-		"sess-planner":     mk("planner"),
-		"sess-gatekeeper":  mk("gatekeeper"),
-		"sess-implementer": mk("implementer"),
-		"sess-reviewer":    mk("reviewer"),
+	data, _ := json.Marshal(payload)
+	return dsh.RawBridgeEvent{Type: "assistant/message", SessionID: sid, Data: data}
+}
+
+// defaultAdvanceScript returns a DSH script where every agent emits one
+// upstream assistant/message with outcome=advance. Session ids match the
+// mock's per-creation counter: scout=1, planner=2, gatekeeper=3,
+// implementer=4, reviewer=5. The Activity stream is bounded by the
+// bridge's run.end{reason=idle} (added by the mock) — no EOF polling.
+func defaultAdvanceScript() map[string][]dsh.RawBridgeEvent {
+	return map[string][]dsh.RawBridgeEvent{
+		"sess-1": {assistantFrame("sess-1", "scout done")},
+		"sess-2": {assistantFrame("sess-2", "planner done")},
+		"sess-3": {assistantFrame("sess-3", "gatekeeper done")},
+		"sess-4": {assistantFrame("sess-4", "implementer done")},
+		"sess-5": {assistantFrame("sess-5", "reviewer done")},
 	}
 }
 
@@ -89,7 +141,7 @@ type testWriter struct{ t *testing.T }
 
 func (w testWriter) Write(p []byte) (int, error) { w.t.Log(string(p)); return len(p), nil }
 
-func newTestWorker(t *testing.T, script map[string][]dsh.RawEvent) (*worker.Worker, *engine.Engine, storage.Repo, func()) {
+func newTestWorker(t *testing.T, script map[string][]dsh.RawBridgeEvent) (*worker.Worker, *engine.Engine, storage.Repo, func()) {
 	t.Helper()
 	repo, err := storage.OpenSQLite(":memory:")
 	if err != nil {
@@ -98,10 +150,8 @@ func newTestWorker(t *testing.T, script map[string][]dsh.RawEvent) (*worker.Work
 	mock := newScriptedDSH()
 	mock.script = script
 	srv := httptest.NewServer(mock.handler())
-	c := dsh.NewClient(srv.URL)
+	c := dsh.NewBridge(srv.URL)
 	ar := agents.New(c, repo)
-	ar.PollInterval = 5 * time.Millisecond
-	ar.PollBudget = 500 * time.Millisecond
 	eng := engine.New(engine.Option{Repo: repo})
 	if err := eng.RegisterWorkflow(featuredev.Workflow(ar)); err != nil {
 		t.Fatal(err)
@@ -138,8 +188,9 @@ func TestWorkerDrivesRunToDone(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	// Pump six ticks manually.
-	for i := 0; i < 6; i++ {
+	// Pump enough ticks for scout+planner+gatekeeper+implementer+reviewer,
+	// each Step iterates one stage. Six ticks covers the full advance.
+	for i := 0; i < 8; i++ {
 		w.TickOnceForTest(ctx, repo)
 	}
 	got, _ := repo.GetRun(ctx, "r-active")
