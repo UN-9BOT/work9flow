@@ -22,11 +22,10 @@ type Config struct {
 	WorkspaceDir    string            `yaml:"workspace_dir"`
 	IterationLimits map[string]int    `yaml:"iteration_limits"`
 	ModelRoles      map[string]string `yaml:"model_roles"`
-	// ProvidersFile points at a TOML file describing LLM providers
-	// (e.g. providers.toml). When DSHBridgeAddr is empty and this is
-	// set, work9flowd boots an inline OpenAI-compatible DSH that
-	// routes requests through the named provider/model from ModelRoles.
-	ProvidersFile   string            `yaml:"providers_file"`
+	// work9flowd only boots through dsh_bridge_addr. The previous inline
+	// OpenAI-compatible DSH path (ProvidersFile + WORK9FLOW_PROVIDERS_FILE)
+	// was removed in bead work9flow-8w0 (dsh-A.10e, P1). Tests that need a
+	// fake DSH use internal/llm/localdsh directly.
 }
 
 // Defaults returns a Config populated with safe local defaults.
@@ -82,9 +81,6 @@ func applyEnv(cfg *Config) {
 	}
 	if v := os.Getenv("WORK9FLOW_WORKSPACE_DIR"); v != "" {
 		cfg.WorkspaceDir = v
-	}
-	if v := os.Getenv("WORK9FLOW_PROVIDERS_FILE"); v != "" {
-		cfg.ProvidersFile = v
 	}
 }
 

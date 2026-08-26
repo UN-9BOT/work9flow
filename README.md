@@ -62,7 +62,7 @@ make test          # go test ./...
 make vet           # go vet ./...
 make tidy          # go mod tidy
 make smoke         # boot runtime + CRUD endpoints + TUI --once
-make smoke-full    # boot inline DSH + scripted provider, drive run → DONE
+make smoke-full    # boot runtime/dsh-bridge + scripted provider, drive run → DONE
 make healthcheck   # non-interactive work9flow --once
 make run-runtime   # запустить work9flowd на 127.0.0.1:7469
 ```
@@ -74,55 +74,39 @@ SQLite database: `<state_dir>/work9flow.db`.
 
 1. `Defaults()` (`http://127.0.0.1:7469`, XDG state dir).
 2. YAML: `--config work9flow.yaml`.
-3. ENV: `WORK9FLOW_STATE_DIR`, `WORK9FLOW_RUNTIME_ENDPOINT`, `WORK9FLOW_DSH_BRIDGE_ADDR`, `WORK9FLOW_WORKSPACE_DIR`, `WORK9FLOW_PROVIDERS_FILE`.
+3. ENV: `WORK9FLOW_STATE_DIR`, `WORK9FLOW_RUNTIME_ENDPOINT`, `WORK9FLOW_DSH_BRIDGE_ADDR`, `WORK9FLOW_WORKSPACE_DIR`.
 
 `work9flow.yaml` пример:
 
 ```yaml
 state_dir: ~/.local/state/work9flow
 runtime_endpoint: http://127.0.0.1:7469
-# dsh_bridge_addr: http://127.0.0.1:7770   # опционально: внешний DSH (Node)
-providers_file: ./providers.toml         # альтернана — поднять inline DSH
+# dsh_bridge_addr: http://127.0.0.1:7770   # external dsh-bridge (Node)
 iteration_limits:
   default: 5
   implementing: 3
-model_roles:
-  default: minim/MiniMax-M3
 ```
 
-## Провайдеры (`providers.toml`)
+## LLM-провайдеры
 
-`providers.toml` описывает LLM-провайдеров с OpenAI-совместимым API.
-Файл подгружается при старте `work9flowd`, когда `dsh_bridge_addr` пуст —
-демон сам поднимает маленький DSH-совместимый HTTP-сервер, который
-перенаправляет сессии в указанный провайдер. Это позволяет гонять
-полный feature-development pipeline (scout → planner → gatekeeper →
-implementer → reviewer) без внешнего Node-процесса DSH.
+`work9flowd` не boot-ит LLM-провайдера сам. Он только подключается к
+`runtime/dsh-bridge` через `dsh_bridge_addr`, а тот в свою очередь
+управляет upstream DeepSeek Harness runtime'ом и его каталогом
+провайдеров (см. `runtime/dsh-bridge/COMPATIBILITY.md` и
+`runtime/dsh-bridge/README.md`).
 
-```toml
-[minim]
-display_name = "Custom (minim)"
-protocol     = "openai"
-base_url     = "https://api.minimax.io/v1"
-api_key_env  = "MINIM_API_KEY"
-default_model = "minim/MiniMax-M3"
+Поддерживается любой OpenAI- или Anthropic-совместимый endpoint,
+который зарегистрирован в upstream DSH cordis-плагине. Сюда входит
+и `minimax` (`https://api.minimax.io/v1`), и любой другой
+OpenAI-совместимый LLM-провайдер.
 
-[[minim.models]]
-id = "MiniMax-M3"
-tier = "strong"
-context_window = 400000
-max_output_tokens = 131072
-supports_thinking = true
-supports_vision = true
-```
-
-Запуск с реальным minim: `export MINIM_API_KEY=... && work9flowd --config=work9flow.yaml`.
+Запуск: `export DSH_RUNTIME_EXE=... && work9flowd --config=work9flow.yaml`.
 
 ## Статус
 
 MVP 01–07 закрыты (см. `bd list` / `git log --oneline`). CRUD-слой,
 state machine, DSH-адаптер, агенты (scout/planner/gatekeeper/implementer/reviewer),
-TUI, inline OpenAI-провайдер и `minim` зарегистрированы. Полный pipeline
+TUI, dsh-bridge зарегистрирован. Полный pipeline
 end-to-end проверяется через `make smoke-full` (run доходит до DONE через
-inline DSH + scripted OpenAI-провайдер). Реальный запуск с `minim` —
+runtime/dsh-bridge + scripted OpenAI-провайдер). Реальный upstream-DSH запуск —
 `export MINIM_API_KEY=... && work9flowd --config=work9flow.yaml`.
